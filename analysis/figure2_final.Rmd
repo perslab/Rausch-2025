@@ -1,0 +1,1466 @@
+
+```{r}
+library(Seurat)
+#library(dendextend)
+library(tidyverse)
+library(edgeR)
+library(ComplexHeatmap)
+library(circlize)
+library(DESeq2)
+library(RcppML)
+library(Matrix)
+library(pROC)
+library(SingleCellExperiment)
+library(miloR)
+library(org.Hs.eg.db)
+library(org.Mm.eg.db)
+library(dynamicTreeCut)
+library(clusterProfiler)
+
+source("R/basic_processing.R")
+source("R/analysis_wrappers.R")
+source("R/helper_functions.R")
+
+fig_path_2 <- here::here("output_figures/figure2/")
+cols_by_geno <- c("mut" = "red", "wt" = "grey70")
+cols_by_diet <- c("grey70","#cb6a49","#a46cb7","#7aa457")
+
+activity_genes <- c("Bdnf", "Crem", "Egr1", "Nr4a1","Nr4a3",
+                    "Pde10a","Fos", "Fosb", "Fosl2", "Homer1", 
+                    "Jun", "Junb", "Vgf")
+
+leptin_geneset <- c("Socs3", "Atf3", "Etv6", "Serpina3h", "Timp1", "Serpina3i", "Nlrc5", "Gpr151", "Rdh10", "Arid5a", 
+                 "Steap4", "Sbno2", "Serpina3n", "Cpne8", "Gucy2c", "Drd1", "Prokr2", "Socs2", "Serpina3g", 
+                 "Cd24a", "C1qtnf7", "Vwa5a", "Gch1", "Nedd9", "Asb4", "Gna14", "Gcnt2", "Styk1", "Tnfrsf11b", 
+                 "Irf9", "Gadd45g", "Traf3ip3", "Stat3", "Lamc2", "Jun", "Thbd", "Esr2", "St18", "Trim62", 
+                 "Fam210b", "Stat2", "Txnrd1", "Arid5b", "Ikzf4", "Parp3", "Pros1", "Iqgap2", "Man1c1", "Nptx2", 
+                 "Palmd", "Bcl3", "Gnal", "Cish", "Khdrbs3", "Serpina3c", "Man2a1", "Prkar2b", "Shb", "Cul5", 
+                 "Pfkfb1", "Myo18b", "Pomc", "Rgs2", "Adra1a", "Necab1", "Skap2", "Magi3", "Ptger2", "Fgl2", 
+                 "Nr3c2", "Ldb2", "Arhgap6", "Srrm4", "Serpina3m", "Pde12", "Socs1", "Taf5")
+
+
+leptin_geneset <- c("Socs3", "Atf3", "Etv6", "Serpina3i", "Sbno2", "Arid5a", "Rdh10", "Cpne8", "Serpina3n", "Drd1", "Socs2",
+               "Gucy2c", "Prokr2", "Cd24a", "Nedd9", "Gch1", "Vwa5a", "Tnfrsf11b", "Gcnt2", "Jun", "Asb4", "Irf9",
+               "Stat3", "Gadd45g", "Thbd", "Traf3ip3", "Trim62", "Lamc2", "St18", "Stat2", "Fam210b", "Nptx2", "Txnrd1",
+               "Ikzf4", "Man1c1", "Cish", "Pros1", "Arid5b", "Palmd", "Shb", "Iqgap2", "Man2a1", "Parp3", "Khdrbs3",
+               "Gnal", "Prkar2b", "Fgl2", "Rnd3", "Cul5", "Pomc", "Ptger2", "Adra1a", "Necab1", "Rgs2", "Magi3",
+               "Skap2", "Taf5", "Nr3c2", "Pde12", "Adamts8", "Myo18b", "Cd44", "Rps6ka3", "Mcm4", "Vim", "Ldb2",
+               "Ptpn1", "Eif1a", "Pde1c", "Ripk1", "Srrm4", "Arhgap6", "Lck", "Adam12", "Ubash3b", "Bhlhe41", "Sntg2",
+               "Lcorl", "Rprm", "Myo1e")
+
+targets::tar_load(arc_diet_labeled)
+targets::tar_load(pb_alldiet)
+targets::tar_load(celltypes_diet)
+names(pb_alldiet) <- celltypes_diet
+targets::tar_load(campbell_scrna.map)
+
+diet_cols <- c("HFD" = "#E8682F","Chow" = "#F0AD74", "Refeed" = "#58C2AF", "Fast" = "#165C5B")
+```
+
+```{r}
+DefaultAssay(arc_diet_labeled) <- "RNA"
+lepr_exp <- AverageExpression(arc_diet_labeled, features="Lepr", group.by="seurat_clusters")
+lepclus <- names(as.data.frame(lepr_exp$RNA))[which(lepr_exp$RNA>1)]
+lepclus <- lepclus[-5]
+```
+
+```{r}
+# load the library
+library(paletteer)
+my_colors <- paletteer::paletteer_d("lisa::FridaKahlo")
+DimPlot(arc_diet_labeled, label=T, pt.size=0.5, group.by="seurat_clusters")  + 
+    DimPlot(arc_diet_labeled, group.by="treatment", cols = my_colors[2:5], pt.size=0.5, shuffle=T) &
+    theme_void() & NoLegend() & ggtitle(NULL)
+
+ggsave(paste0(fig_path_2,"umapref.pdf"), h=6, w=12)
+```
+
+```{r}
+targets::tar_load(hfdveh_celldist)
+targets::tar_load(fastveh_celldist)
+
+dat_ob <- hfdveh_celldist$results %>% janitor::clean_names() %>% rownames_to_column("clus")
+dat <- fastveh_celldist$results %>% janitor::clean_names() %>% rownames_to_column("clus") 
+# Merging on clus
+merged_df <- merge(dat, dat_ob, by="clus", suffixes = c("_mut", "_wt"))
+
+# Plotting
+p <- ggplot(merged_df, aes(x=dist_mut, y=dist_wt)) +
+  geom_errorbarh(aes(xmin=x95_percent_ci_low_mut, xmax=x95_percent_ci_upper_mut), width=0, alpha=0.25) +
+  geom_errorbar(aes(ymin=x95_percent_ci_low_wt, ymax=x95_percent_ci_upper_wt), height=0, alpha=0.25) +
+  geom_point(size=2) +
+  geom_abline(lty=2) +
+  ggrepel::geom_text_repel(aes(label = clus), max.overlaps=10) +
+  labs(x="Chow v Fast", y="HFD v Chow") +
+  coord_equal() +
+  theme_classic()
+
+ggsave(paste0(fig_path_2, "scdist.pdf"), h=4, w=4)
+```
+
+```{r}
+DefaultAssay(arc_diet_labeled) <- "RNA"
+arc_diet_labeled <- AddModuleScore(arc_diet_labeled, features=list(leptin_geneset), assay="RNA")
+
+arc_lepsig_data <- arc_diet_labeled[[]]  %>% 
+    filter(seurat_clusters %in% lepclus)  %>% 
+    group_by(treatment, seurat_clusters, hash.mcl.ID, hash_pool,  orig.ident)  %>% 
+    summarise(mean = mean(Cluster1)) %>% 
+    nest(-seurat_clusters)  %>% 
+    mutate(mod = purrr::map(data, function(x) lme4::lmer(mean ~ treatment + (1|hash.mcl.ID) + (1|hash_pool), data=x)))
+
+res <- purrr::map_dfr(arc_lepsig_data$mod, ~emmeans::emmeans(.x, pairwise~treatment)$contrasts  %>%  data.frame(), .id="clus")  %>% 
+    mutate(padj = p.adjust(p.value, "BH"))  %>% 
+    mutate(ct = lepclus[as.numeric(clus)])  %>%  
+    filter(contrast != "Fast - HFD", contrast != "HFD - Refeed")  %>%  
+    arrange(padj)  %>% 
+    dplyr::select(contrast, estimate, padj, ct)
+
+res  %>% arrange(ct)
+```
+
+```{r}
+arc_diet_labeled[[]]  %>% 
+    filter(seurat_clusters %in% lepclus)  %>% 
+    #inner_join(outdio, by="seurat_clusters")  %>% 
+    #filter(!treatment%in%c("Refeed"))  %>% 
+    group_by(hash.mcl.ID, orig.ident, treatment, seurat_clusters)  %>% 
+    summarise(mean = mean(Cluster1))  %>% 
+    ggplot() +
+    aes(y=mean, x=seurat_clusters,fill=fct_relevel(treatment,c("Fast","Refeed", "Chow","HFD"))) +
+    geom_boxplot(outlier.shape=NA) +
+    #geom_point(position = position_dodge(width=0.8), shape=".") +
+    #ggridges::geom_density_ridges() 
+    cowplot::theme_cowplot() + cowplot::background_grid() + labs(fill="Diet", x=NULL, y="LGS Activity") + theme(legend.position="none")
+
+ggsave(paste0(fig_path_2,"a.pdf"), h=2, w=5)
+```
+
+```{r}
+# Initialize a list to store fitted models and DEG results
+pb_objects <- list()
+
+for (ct in lepclus) {
+  # Prepare edgeR object for the specific cell type
+  pb_objects[[ct]] <- edger_prep(subset(arc_diet_labeled, subset = hash.mcl.ID != "REFED2"),
+    celltype_column = "seurat_clusters", trt_group = "treatment", celltypes = ct)
+}
+
+deg_results <- list()
+
+# Loop over each cell type to fit the model
+for (ct in lepclus) {
+  
+    print(ct)
+    keep <- filterByExpr(pb_objects[[ct]], group=pb_objects[[ct]]$samples$treatment,
+                       min.count = 5, min.total.count = 15)
+    pb_objects[[ct]] <- pb_objects[[ct]][keep, , keep.lib.sizes=FALSE]
+    pb_objects[[ct]] <- normLibSizes(pb_objects[[ct]])
+    #pb_alldiet[[ct]]$samples$group <- pb_alldiet[[ct]]$samples$treatment
+    pb_objects[[ct]]$samples$treatment <- factor(pb_objects[[ct]]$samples$treatment, levels = c("Chow", "HFD", "Refeed", "Fast"))
+    design <- model.matrix(~treatment + hash_pool, data = pb_objects[[ct]]$samples)
+    colnames(design) <- gsub(":", "_", colnames(design))
+
+    pb_objects[[ct]] <- estimateDisp(pb_objects[[ct]], design, robust=TRUE)
+    fit <- glmQLFit(pb_objects[[ct]], design, robust=TRUE)
+
+    qlf <- glmQLFTest(fit, coef=2:4)
+    deg_results[[ct]] <- topTags(qlf, n=Inf, p=0.05) 
+
+}
+
+alldeg <- purrr::map_dfr(deg_results, data.frame, .id="ct")  
+
+write_csv(alldeg, "diet_degenes.csv")
+purrr::map_dfr(deg_results, dim, .id="ct") 
+```
+
+```{r}
+alldeg %>% 
+  filter(if_any(starts_with("logFC"), ~ abs(.) > 0.5)) %>%
+  group_by(ct)  %>% 
+  summarise(count = n_distinct(gene))
+
+alldeg %>% janitor::clean_names()  %>% 
+    filter(ct %in% c("12","Agrp","29"),
+           if_any(starts_with("log_"), ~ abs(.) > 0.5))  %>% 
+    nest(-ct)   %>% 
+    mutate(res = purrr::map(data, function(x) lm(log_fc_treatment_hfd~log_fc_treatment_fast, data=x)  %>% broom::tidy(.)))  %>%  
+    unnest(res)
+
+alldeg %>% janitor::clean_names()  %>% 
+    filter(ct %in% c("12","Agrp","29"),
+           if_any(starts_with("log_"), ~ abs(.) > 0.5)) %>% 
+    ggplot() +
+    aes(x=log_fc_treatment_fast, y=log_fc_treatment_hfd) +
+    geom_point(shape=".") +
+    facet_wrap(~ct, ncol=1) + coord_equal() +
+    lims(x=c(-5,5), y=c(-5,5)) +
+    geom_hline(yintercept=0, lty=2) +
+    geom_vline(xintercept=0, lty=2) +
+    geom_smooth(method="lm") +
+    theme_classic()
+
+ggsave(paste0(fig_path_2, "a.pdf"), w=5, h=5)
+```
+
+# Cluster Glp1r neuron DEG
+```{r}
+pbd <- pb_objects[["12"]]
+pbd$samples$group <- pbd$samples$treatment
+pbd$samples$treatment <- factor(pbd$samples$treatment, levels = c("HFD", "Chow", "Refeed", "Fast"))
+
+logcpm <- edgeR::cpm(pbd, prior.count=5, log=T)
+logcpm <- limma::removeBatchEffect(logcpm, pbd$samples$hash_pool,
+                                design = model.matrix(~treatment, data=pbd$samples))
+glp_deg <- alldeg %>% filter(ct %in% 12) %>% pull(gene)
+expr_dat <- logcpm[rownames(logcpm) %in% glp_deg,]
+expr_dat <- t(scale(t(expr_dat)))
+
+tolabel <- c("Nr4a3","Npas4", "Gabra3", "Gabra4", "Gabra5","Grip1","Gabra1","Sv2c","Pde10a","Grin1",
+            "Vgf", "Tenm2","Itpr1","Nrcam","Scn9a","Fos","Gabrb1", "Gabrb2", "Gabrb3")
+
+idx <- match(tolabel, rownames(expr_dat))
+
+ha = HeatmapAnnotation(d = pbd$samples$treatment[order(pbd$samples$treatment)],
+        col = list(d = c("HFD" = my_colors[[1]], "Chow" = my_colors[[2]],
+                            "Refeed" =  my_colors[[3]], "Fast" = my_colors[[4]])), 
+        simple_anno_size = unit(0.3, "cm"),annotation_name_gp= gpar(fontsize = 8))
+ra = rowAnnotation(foo = anno_mark(at = idx, labels = tolabel))
+
+pdf(paste0(fig_path_2, "glp1r_hmap.pdf"), h=4, w=5)
+set.seed(426)
+hmap <- Heatmap(expr_dat[,order(pbd$samples$treatment)], show_row_dend=T, 
+                   show_row_names = F,  right_annotation = ra, row_split=5,
+                    top_annotation = ha, cluster_columns=F, clustering_method_rows="ward.D2",
+                    show_column_names=F, row_names_gp = gpar(fontsize = 2))
+ht <- draw(hmap)
+dev.off()
+
+cluster_genes <- purrr::map(row_order(ht), function(x) {
+    rownames(expr_dat)[x]
+})
+
+names(cluster_genes) <- names(row_order(ht))
+cluster_genes <- enframe(cluster_genes)  %>%  unnest(value)
+cluster_genes %>%  write_csv("glp1r_lepr_hmap_genes.csv")
+
+compare_result <- compareCluster(value~name, 
+    data= cluster_genes, maxGSSize=300, minGSSize=5,
+    fun = "enrichGO",
+    OrgDb = org.Mm.eg.db,
+    ont = "ALL",
+    keyType = "SYMBOL",
+    pvalueCutoff = 0.05,
+    universe = rownames(pbd$counts)
+  )
+
+compare_result@compareClusterResult  %>%  write_csv("glp1r_lepr_hmap_goterms.csv")
+
+topgo <- simplify(
+  compare_result,
+  cutoff = 0.5,
+  by = "p.adjust",
+  select_fun = min,
+  measure = "Wang",
+  semData = NULL
+)
+
+
+dotplot(topgo) + theme(axis)
+ggsave(paste0(fig_path_2, "comparegoplot.pdf"),h=12,w=6)
+topgo@compareClusterResult %>% filter(Cluster==2)
+``` 
+
+```{r}
+pbd <- pb_objects[["Agrp"]]
+pbd$samples$group <- pbd$samples$treatment
+pbd$samples$treatment <- factor(pbd$samples$treatment, levels = c("HFD", "Chow", "Refeed", "Fast"))
+
+logcpm <- edgeR::cpm(pbd, prior.count=5, log=T)
+logcpm <- limma::removeBatchEffect(logcpm, pbd$samples$hash_pool,
+                                design = model.matrix(~treatment, data=pbd$samples))
+glp_deg <- alldeg %>% filter(ct %in% "Agrp") %>% pull(gene)
+expr_dat <- logcpm[rownames(logcpm) %in% glp_deg,]
+expr_dat <- t(scale(t(expr_dat)))
+
+genes <- c("Layn", "Cdkn1a", "Svs2", "Lyve1", "Mypn", "Slco1a1", "Nts", "Hhip", "Mt2", "Cftr", "Ntsr1", "1700024P16Rik", "Pappa2", "Ptk2b", "Vgf", "Bmp2", "Fosl2", "Ccl17", "Thbs2", "Fut4", "Gpr3", "Nmur2", "Spry4", "Bmp3", "Sulf1", "St8sia2", "Mdga1", "Tnfrsf11b", "Rgs6", "Bhlhe40")
+
+tolabel <- c("Nr4a3","Npas4", "Agrp", "Ghsr", "Cdkn1a","Slco1a1","Sv2c","Pde10a","Bmp2",
+            "Vgf", "Tenm2","Itpr1","Nrcam","Scn9a","Fos","Npy")
+
+idx <- match(tolabel, rownames(expr_dat))
+
+ha = HeatmapAnnotation(d = pbd$samples$treatment[order(pbd$samples$treatment)],
+        col = list(d = c("HFD" = my_colors[[1]], "Chow" = my_colors[[2]],
+                            "Refeed" =  my_colors[[3]], "Fast" = my_colors[[4]])), 
+        simple_anno_size = unit(0.3, "cm"),annotation_name_gp= gpar(fontsize = 8))
+ra = rowAnnotation(foo = anno_mark(at = idx, labels = tolabel))
+
+pdf(paste0(fig_path_2, "agrp_hmap.pdf"), h=4, w=5)
+set.seed(426)
+hmap <- Heatmap(expr_dat[,order(pbd$samples$treatment)], show_row_dend=T, 
+                   show_row_names = F,  right_annotation = ra, row_split=4,
+                    top_annotation = ha, cluster_columns=F, clustering_method_rows="ward.D2",
+                    show_column_names=F, row_names_gp = gpar(fontsize = 2))
+ht <- draw(hmap)
+dev.off()
+
+cluster_genes <- purrr::map(row_order(ht), function(x) {
+    rownames(expr_dat)[x]
+})
+
+names(cluster_genes) <- names(row_order(ht))
+cluster_genes <- enframe(cluster_genes)  %>%  unnest(value)
+cluster_genes %>%  write_csv("agrp_hmap_genes.csv")
+
+
+compare_result <- compareCluster(value~name, 
+    data= cluster_genes, maxGSSize=300, minGSSize=5,
+    fun = "enrichGO",
+    OrgDb = org.Mm.eg.db,
+    ont = "ALL",
+    keyType = "SYMBOL",
+    pvalueCutoff = 0.05,
+    universe = rownames(pbd$counts)
+  )
+
+dotplot(compare_result)
+compare_result@compareClusterResult  %>%  write_csv("agrp_hmap_goterms.csv")
+```
+```{r}
+library(msigdbr)
+
+pairwise_results <- list()
+
+# Loop over each cell type to fit the model
+for (ct in lepclus) {
+  
+    print(ct)
+    keep <- filterByExpr(pb_objects[[ct]], group=pb_objects[[ct]]$samples$treatment,
+                       min.count = 5, min.total.count = 15)
+    pb_objects[[ct]] <- pb_objects[[ct]][keep, , keep.lib.sizes=FALSE]
+    pb_objects[[ct]] <- normLibSizes(pb_objects[[ct]])
+    #pb_alldiet[[ct]]$samples$group <- pb_alldiet[[ct]]$samples$treatment
+    pb_objects[[ct]]$samples$treatment <- factor(pb_objects[[ct]]$samples$treatment, levels = c("Chow", "HFD", "Refeed", "Fast"))
+    design <- model.matrix(~treatment + hash_pool, data = pb_objects[[ct]]$samples)
+    colnames(design) <- gsub(":", "_", colnames(design))
+
+    pb_objects[[ct]] <- estimateDisp(pb_objects[[ct]], design, robust=TRUE)
+    fit <- glmQLFit(pb_objects[[ct]], design, robust=TRUE)
+
+    qlf <- glmQLFTest(fit, coef=2)
+    pairwise_results[[ct]][["HFD"]] <- topTags(qlf, n=Inf) 
+    qlf <- glmQLFTest(fit, coef=4)
+    pairwise_results[[ct]][["Fast"]] <- topTags(qlf, n=Inf) 
+}
+
+glp_group <- purrr::map_dfr(pairwise_results[["12"]],~.x$table, .id="comp")  %>%
+    filter(FDR<0.05&abs(logFC)>0.5)  %>% 
+    mutate(group = paste0(sign(logFC),"_",comp))  %>% 
+    select(group, gene)
+
+compare_result <- compareCluster(gene~group, 
+    data= glp_group, maxGSSize=300, minGSSize=10,
+    fun = "enrichGO",
+    OrgDb = org.Mm.eg.db,
+    ont = "ALL",
+    keyType = "SYMBOL",
+    pvalueCutoff = 0.05,
+    universe = rownames(pbd$counts)
+  )
+
+
+topgo <- simplify(
+  compare_result,
+  cutoff = 0.1,
+  by = "p.adjust",
+  select_fun = min,
+  measure = "Wang",
+  semData = NULL
+)
+
+dotplot(compare_result)
+dev.off()
+
+topgo@result %>% group_by(sign(NES)) %>% dplyr::slice_min(n=7, order_by=qvalue)  %>%  
+    ggplot() +
+    aes(x=NES, y=fct_reorder(str_wrap(Description,width=35),NES), fill=-log10(qvalue)) +
+    geom_col(color="black", width=0.8) +
+    cowplot::theme_minimal_hgrid() + theme(axis.text.y= element_text(size=5)) +
+    labs(y=NULL)
+
+ggsave(paste0(fig_path_2, "hfd_go.pdf"),h=4,w=5)
+
+ggsave("hfd.pdf", h=5,w=3)
+
+pairwise_go_glp1 <- purrr::map_dfr(pairwise_results[["12"]], data.frame, .id="comp")  %>%  
+    filter(abs(logFC)>0.5) %>% 
+    mutate(group = interaction(sign(logFC), comp))  %>% 
+    dplyr::select(gene, group)
+
+t2g <- msigdbr(species = "Mus musculus", category = "C5")  %>% dplyr::select(gs_name, gene_symbol)
+hfd <- GSEA(hfd_score, TERM2GENE = t2g)
+
+compare_result <- compareCluster(gene~group, 
+    data= pairwise_go_glp1, maxGSSize=300, minGSSize=5,
+    fun = "enrichGO",
+    OrgDb = org.Mm.eg.db,
+    ont = "BP",
+    keyType = "SYMBOL",
+    pvalueCutoff = 0.05,
+    universe = rownames(pbd$counts)
+  )
+
+dotplot(compare_result)
+
+topgo <- simplify(
+  hfd,
+  cutoff = 0.5,
+  by = "p.adjust",
+  select_fun = min,
+  measure = "Wang",
+  semData = NULL
+)
+
+
+compare_result@compareClusterResult  %>% filter(Cluster=="-1.HFD")  %>%  
+    arrange(qvalue)  %>% 
+     head(10)
+```
+
+```{r}
+pbd <- pb_objects[["Agrp"]]
+pbd$samples$group <- pbd$samples$treatment
+pbd$samples$treatment <- factor(pbd$samples$treatment, levels = c("HFD", "Chow", "Refeed", "Fast"))
+
+logcpm <- edgeR::cpm(pbd, prior.count=5, log=T)
+logcpm <- limma::removeBatchEffect(logcpm, pbd$samples$hash_pool,
+                                design = model.matrix(~treatment, data=pbd$samples))
+glp_deg <- alldeg %>% filter(ct %in% "Agrp") %>% pull(gene)
+expr_dat <- logcpm[rownames(logcpm) %in% glp_deg,]
+expr_dat <- t(scale(t(expr_dat)))
+
+tolabel <- c("Nr4a3","Npas4", "Gabra3", "Gabra4", "Gabra5","Grip1","Gabra1","Grin1",
+             "Sez6l","Vgf", "Tenm2","Itpr1","Nrcam","Scn9a","Fos","Gabrg3")
+
+idx <- match(tolabel, rownames(expr_dat))
+
+ha = HeatmapAnnotation(d = pbd$samples$treatment[order(pbd$samples$treatment)],
+        col = list(d = c("HFD" = my_colors[[1]], "Chow" = my_colors[[2]],
+                            "Refeed" =  my_colors[[3]], "Fast" = my_colors[[4]])), 
+        simple_anno_size = unit(0.3, "cm"),annotation_name_gp= gpar(fontsize = 8))
+ra = rowAnnotation(foo = anno_mark(at = idx, labels = tolabel))
+
+pdf(paste0(fig_path_2, "agrp.pdf"), h=4, w=5)
+hmap <- Heatmap(expr_dat[,order(pbd$samples$treatment)], show_row_dend=T, 
+                   show_row_names = F,  right_annotation = ra, row_split=5,
+                    top_annotation = ha, cluster_columns=F, clustering_method_rows="ward.D2",
+                    show_column_names=F, row_names_gp = gpar(fontsize = 2))
+ht <- draw(hmap)
+dev.off()
+```
+
+# Cluster Agrp neuron DEG
+```{r}
+pbd <- pb_alldiet[["Agrp"]]
+pbd$samples$group <- pbd$samples$treatment
+pbd$samples$treatment <- factor(pbd$samples$treatment, levels = c("HFD", "Chow", "Refeed", "Fast"))
+pbd <- pbd[, which(pbd$samples$sample != "REFED2")]
+logcpm <- edgeR::cpm(pbd, prior.count=5, log=T)
+logcpm <- limma::removeBatchEffect(logcpm, pbd$samples$hash_pool,
+                                design = model.matrix(~treatment, data=pbd$samples))
+expr_dat <- logcpm[rownames(logcpm) %in% hlist$gene[hlist$ct==6],]
+expr_dat <- t(scale(t(expr_dat)))
+
+ha = HeatmapAnnotation(d = pbd$samples$treatment[order(pbd$samples$treatment)],
+        col = list(d = c("HFD" = my_colors[[1]], "Chow" = my_colors[[2]],
+                            "Refeed" =  my_colors[[3]], "Fast" = my_colors[[4]])), 
+        simple_anno_size = unit(0.3, "cm"),annotation_name_gp= gpar(fontsize = 8))
+ra = rowAnnotation(foo = anno_mark(at = idx, labels = tolabel))
+
+pdf(paste0(fig_path_2, "agrp_hmap.pdf"), h=4, w=5)
+hmap <- Heatmap(expr_dat[,order(pbd$samples$treatment)], show_row_dend=T, use_raster=T,
+                   show_row_names = F,  right_annotation = ra, row_km=6,
+                    top_annotation = ha, cluster_columns=F, clustering_method_rows="ward.D2",
+                    show_column_names=F, row_names_gp = gpar(fontsize = 2))
+ht <- draw(hmap)
+dev.off()
+```
+
+```{r}
+compare_result <- compareCluster(gene~name, 
+    data= clustered_degs, maxGSSize=300,
+    fun = "enrichGO",
+    OrgDb = org.Mm.eg.db,
+    ont = "ALL",
+    keyType = "SYMBOL",
+    pvalueCutoff = 0.05,
+    universe = rownames(pbd$counts)
+  )
+
+topgo <- simplify(
+  ego,
+  cutoff = 0.5,
+  by = "p.adjust",
+  select_fun = min,
+  measure = "Wang",
+  semData = NULL
+)
+```
+
+```{r}
+pairwise_deg <- purrr::map_dfr(lepclus, function(x) {
+    pbd <- pb_alldiet[[x]]
+    pbd$samples$group <- pbd$samples$treatment
+    pbd <- pbd[, which(pbd$samples$sample != "REFED2")]
+    pbd$samples$treatment <- factor(pbd$samples$treatment, levels = c("Chow", "HFD", "Refeed", "Fast"))
+    design <- model.matrix(~0 + treatment + hash_pool, data = pbd$samples)
+    colnames(design) <- gsub(":", "_", colnames(design))
+  
+    contrast_matrix <- makeContrasts(
+      log_hvc = treatmentHFD - treatmentChow,
+      log_fvc = treatmentFast - treatmentChow,
+      log_rvf = treatmentRefeed - treatmentFast,
+      levels = design)
+  
+    fitd <- voomLmFit(pbd, design)
+    fit2 <- contrasts.fit(fitd, contrasts = contrast_matrix)
+    fit2 <- eBayes(fit2, robust = FALSE)
+
+    alldeg <- topTable(fit2, coef = "log_hvc", n = Inf) %>% mutate(comp = "hvc") %>%
+                bind_rows(topTable(fit2, coef = "log_fvc", n = Inf) %>% mutate(comp = "fvc")) %>%
+                bind_rows(topTable(fit2, coef = "log_rvf", n = Inf) %>% mutate(comp = "rvf"))  %>% 
+                mutate(ct = x)
+
+}, .id="loop")
+
+
+mapping.data1 <- read.table(gzfile("/projects/perslab/data/yggdrasil/projects/mludwig/Ludwig-2021/data/gene_info/Mus_musculus.GRCm38.90.gene_name_version2ensembl.txt.gz"), header=T)
+mapping.data2 <- read.table(gzfile("/projects/perslab/data/yggdrasil/projects/mludwig/Ludwig-2021/data/gene_info/map_hsapiens_mmusculus.gz"), header = T)
+mapping.data3 <- read.csv("/projects/perslab/data/yggdrasil/projects/mludwig/DVC/data/gene_info/NCBI37.3.gene.loc", sep = "", header = F)
+colnames(mapping.data3) <- c("ENTREZID", "chr", "start", "end", "strand", "ALIAS")
+ 
+for_ldsc <- enframe(split(rownames(expr_dat), f=clusters_dynamic))  %>% 
+ unnest(value)  %>% 
+ bind_rows(data.frame(name = rep("leptin_targs", n=length(expanded_metagenes)), value = expanded_metagenes))  %>% 
+ mutate(ind= 1)  %>% 
+ pivot_wider(names_from=name, values_from=ind, values_fill=0)  %>% 
+ dplyr::rename(symbol=value) 
+
+for_ldsc <- pairwise_deg  %>% 
+  dplyr::select(gene, adj.P.Val, comp,ct)  %>% 
+  mutate(name = interaction(comp,ct))  %>% 
+  select(-comp, -ct)  %>% 
+  dplyr::rename(symbol=gene)  %>% 
+  pivot_wider(names_from=name, values_from=adj.P.Val)  %>% 
+  mutate(across(where(is.numeric), ~ ifelse(. < 0.1, 1, 0)))
+
+
+for_ldsc$gene <- mapping.data1$ensembl_gene_id[match(for_ldsc$symbol, mapping.data1$gene_name_optimal)]
+for_ldsc$gene <- mapping.data2$ensembl_gene_id[
+  match(for_ldsc$gene, mapping.data2$mmusculus_homolog_ensembl_gene)]
+for_ldsc <- for_ldsc[!is.na(for_ldsc$gene),]
+covar_file <- read.csv("/projects/perslab/people/lhv464/glp1r_leptin/results/tabula_muris.mu.csv", header=T)
+for_ldsc <- for_ldsc[, c(ncol(for_ldsc), 2:(ncol(for_ldsc)-1))]  %>%  
+  full_join(., covar_file  %>% dplyr::select(Brain_Non.Myeloid.neuron, gene))  %>% 
+  janitor::clean_names() 
+for_ldsc[is.na(for_ldsc)] <- 0
+
+write.table(for_ldsc,
+           file = "/projects/perslab/people/lhv464/glp1r_leptin/results/LDSC_clusterglp_diet_deg.csv",
+            row.names = F, sep = ",")
+
+write.csv(pairwise_deg, "results/diet_pairwise_deg.csv")
+
+pairwise_deg <- read.csv("results/diet_pairwise_deg.csv")
+
+filtdeg <- pairwise_deg  %>%  filter(adj.P.Val<0.05)  %>% 
+        mutate(group = interaction(ct, comp))  %>% 
+        filter(ct %in% lepclus)
+
+milo_seur <- CreateSeuratObject(counts=score_sums)
+milo_seur <- SCTransform(milo_seur)
+milo_seur <- RunPCA(milo_seur)
+milo_seur <- RunUMAP(milo_seur, dims=1:20)
+milo_seur <- FindNeighbors(milo_seur, dims=1:20)
+milo_seur <- FindClusters(milo_seur)
+DimPlot(milo_seur)
+dev.off()
+
+mat <- milo_seur@assays$SCT@data[rowSums(milo_seur@assays$SCT@counts>5)>5,]  %>% data.frame() 
+
+genes_converted <- data.frame(convert_mouse_to_human(rownames(mat))) %>% filter(!duplicated(X1))
+
+genes_entrez <- AnnotationDbi::select(org.Hs.eg.db,
+                            keys = unique(genes_converted$X2),
+                            columns = c("ENTREZID", "SYMBOL"),
+                            keytype = "SYMBOL")  %>% 
+                            filter(!duplicated(SYMBOL))
+humdeg <- inner_join(genes_entrez, genes_converted, by=c("SYMBOL" = "X2"))  %>% 
+    inner_join(mat  %>% rownames_to_column("mouse_gene"), by=c("X1"="mouse_gene"))  %>% dplyr::select(c(-SYMBOL,-X1))  %>%
+    dplyr::rename(GENE=ENTREZID)  %>% 
+    filter(!duplicated(GENE))  %>% 
+    mutate(GENE=as.numeric(GENE)) 
+
+humdeg$Average <- rowMeans(humdeg[,-1])
+
+brainexpr <- read.table("/projects/perslab/people/lhv464/glp1r_leptin/tissue_gex.cov.txt", header=T)  %>% 
+    dplyr::select(GENE, BRAIN_EXPR)
+
+wcovar <- inner_join(humdeg, brainexpr, by="GENE") 
+
+res <- read.table("../step4a.gsa.out", header=T) %>%  data.frame()  %>% 
+    mutate(VARIABLE = gsub("X","", VARIABLE))  %>% 
+    dplyr::rename(Nhood=VARIABLE)  %>% 
+    dplyr::select(Nhood, BETA, P)  %>%
+    filter(!Nhood%in%c("BRAIN_EPR","Average"))
+   
+head(res)
+
+res <- bind_cols(res, da_results_fast  %>% data.frame()  %>%  dplyr::rename(newclus = seurat_clusters,   
+    fasteff=logFC))
+rownames(res) <- 1:1281
+sum(is.na(milo_seur$P))
+dev.off()
+milo_seur <- AddMetaData(milo_seur, res)
+milo_seur <- AddMetaData(milo_seur, da_results_hfd)
+
+milo_seur[["score"]] <- -log10(milo_seur$P)
+FeaturePlot(milo_seur, "score", order=T)
+dev.off()
+
+milo_seur[[]]  %>% filter(ct=="9")  %>% lm(score~hfdeff, data=.)  %>%  summary()
+    ggplot() +
+    aes(x=fasteff, y= score) +
+    geom_point()
+dev.off()
+
+milo_seur 
+da_results_hfd  %>% data.frame()  %>% column_to_rownames("Nhood")
+
+genes_converted <- data.frame(convert_mouse_to_human(rownames(mat))) %>% filter(!duplicated(X1))
+genes_entrez <- AnnotationDbi::select(org.Hs.eg.db,
+                            keys = genes_converted$X2,
+                            columns = c("ENTREZID", "SYMBOL"),
+                            keytype = "SYMBOL")  %>% 
+                            filter(!duplicated(SYMBOL))
+humdeg <- inner_join(genes_entrez, genes_converted, by=c("SYMBOL" = "X2"))  %>% 
+    inner_join(mat, by=c("X1"="mouse_gene"))  %>% dplyr::select(c(-SYMBOL,-X1))  %>%
+    dplyr::rename(GENE=ENTREZID)  %>% 
+    filter(!duplicated(GENE))  %>% 
+    mutate(GENE=as.numeric(GENE)) 
+
+humdeg$Average <- rowMeans(humdeg[,-1])
+
+brainexpr <- read.table("/projects/perslab/people/lhv464/glp1r_leptin/tissue_gex.cov.txt", header=T)  %>% 
+    dplyr::select(GENE, BRAIN_EXPR)
+
+wcovar <- inner_join(humdeg, brainexpr, by="GENE") 
+head(wcovar)
+
+wcovar[1:5,1:5]
+humdeg <- purrr::map_dfr(split(filtdeg$gene, f=filtdeg$group), function(x) {
+            if(length(x)>10) {
+                genes_converted <- data.frame(convert_mouse_to_human(x)) %>% filter(!duplicated(X1))
+                genes_entrez <- AnnotationDbi::select(org.Hs.eg.db,
+                            keys = genes_converted$X2,
+                            columns = c("ENTREZID", "SYMBOL"),
+                            keytype = "SYMBOL")  %>% 
+                            filter(!duplicated(SYMBOL))
+                return(genes_entrez)
+            } else {
+                NULL
+            }
+        },.id = "comp")
+
+write.table(wcovar, file="../magma_genesets/milo_test.txt", sep = "\t", quote=F, row.names=F)
+
+# List of gene.raw files to process
+gene_files <- c(
+  "/projects/perslab/apps/MAGMA/out/Locke-UKBB2018/Locke-UKBB2018_UPDATED.genes.raw"
+  #"/projects/perslab/apps/MAGMA/out/glucose_GCST90019508/glucose_GCST90019508.genes.raw",
+  #"/projects/perslab/apps/MAGMA/out/glucose_GCST90271557/glucose_GCST90271557.genes.raw",
+  #"/projects/perslab/apps/MAGMA/out/HbA1c_GCST007954/HbA1c_GCST007954.genes.raw",
+  #"/projects/perslab/apps/MAGMA/out/NAFL_UKBB/NAFL_UKBB.genes.raw",
+  #"/projects/perslab/apps/MAGMA/out/Weight_GWASatlas3440/Weight_GWASatlas3440.genes.raw",
+  #"/projects/perslab/apps/MAGMA/out/ArmFatFreeMass_GWASatlas3462/ArmFatFreeMass_GWASatlas3462.genes.raw",
+  #"/projects/perslab/apps/MAGMA/out/ArmFatPercentage_GWASatlas3460/ArmFatPercentage_GWASatlas3460.genes.raw",
+  #"/projects/perslab/apps/MAGMA/out/ArmFatMass_GWASatlas3461/ArmFatMass_GWASatlas3461.genes.raw",
+  #"/projects/perslab/apps/MAGMA/out/ArmImpedance_GWASatlas3450/ArmImpedance_GWASatlas3450.genes.raw",
+  #"/projects/perslab/apps/MAGMA/out/BodyFatMass_GWASatlas3442/BodyFatMass_GWASatlas3442.genes.raw",
+  #"/projects/perslab/apps/MAGMA/out/BodyFatPercentage_GWASatlas3441/BodyFatPercentage_GWASatlas3441.genes.raw",
+  #"/projects/perslab/people/nvg559/glucose/magma_gsa/dat/Qiao_metaGLU.genes.raw",
+  #"/projects/perslab/people/nvg559/glucose/magma_gsa/dat/Qiao_RG.genes.raw"
+  # Add more files as needed
+)
+
+# Common parameters
+set_annot_file <- "/projects/perslab/people/lhv464/magma_genesets/milo_test.txt"
+set_col <- "comp"
+gene_col <- "ENTREZID"
+covar_file <- "/projects/perslab/people/lhv464/glp1r_leptin/tissue_gex.cov.txt"
+# Loop through each gene file
+for (gene_file in gene_files) {
+  # Extract a base name for the output file
+  base_name <- basename(gene_file)
+  output_name <- sub("\\.genes\\.raw$", "_enrichment", base_name)
+  
+  # Construct the command
+  args <- c(
+    "--gene-results", gene_file,
+    "--set-annot", set_annot_file,
+    paste0("set-col=", set_col),
+    paste0("gene-col=", gene_col),
+    "--gene-covar", covar_file,
+    "--model", "condition-hide=BRAIN_EXPR", "analyse=sets",
+    "--out", paste0("gene_sets/diet_deg/",output_name)
+  )
+  
+  # Execute MAGMA command
+  result <- system2("magma", args = args)
+  
+  # Check the result
+  if (result == 0) {
+    cat("Successfully processed:", gene_file, "\n")
+  } else {
+    cat("Error processing:", gene_file, "\n")
+  }
+}
+```
+
+```{r}
+glp <- subset(milo_seur, subset = newclus ==12)
+cormat <- lapply(1:nrow(glp@assays$SCT@data), function(x) cor(glp@assays$SCT@data[x,], glp$score))
+corvec <- unlist(cormat)
+names(corvec) <- rownames(glp@assays$SCT@data)
+sort(corvec, decreasing=T)  %>% head(n=50)
+```
+
+```{r}
+library(clusterProfiler)
+library(org.Mm.eg.db) 
+ego <- enrichGO(gene          =  clustered_degs$gene[clustered_degs$name==2],  
+                keyType       = 'SYMBOL',
+                universe      = rownames(pbd),
+                maxGSSize=300, 
+                minGSSize=5,
+                OrgDb         = org.Mm.eg.db,
+                ont           = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.05,
+                qvalueCutoff  = 0.05,
+                readable      = TRUE)
+head(ego@result, n=50)
+```
+
+```{r}
+gpdownmod <- clustered_degs %>% filter(name == 5) %>% pull(gene)
+gpgaba <- clustered_degs %>% filter(name == 3) %>% pull(gene)
+gpdio <- clustered_degs %>% filter(name == 4) %>% pull(gene)
+DefaultAssay(arc_lepip) <- "RNA"
+arc_lepip <- AddModuleScore(arc_lepip, features = list(metagenes, gpdownmod, gpgaba, gpdio))
+arc_lepip[[]] %>% filter(predicted.celltype==12, time!=24) %>% 
+    pivot_longer(starts_with("Clust"))  %>% 
+    group_by(treatment, hash.mcl.ID, orig.ident, name,geno) %>%
+    summarise(mean=mean(value))  %>% 
+    filter(treatment=="Sal") %>% 
+    ggplot() + aes(x=geno,y=mean, fill=geno) + 
+    geom_boxplot() + facet_wrap(~name, scales="free_y") +
+    theme_classic()
+ggsave("a.pdf",h=3,w=4)
+```
+
+```{r}
+library(scDist)
+library(lemon)
+test <-subset(arc_lepip, subset = predicted.celltype %in% celltypes & treatment == "Sal") 
+table(test$geno, test$predicted.celltype, test$time)
+obwt_celldist <- run_scdist(obj = test, fixed.effects = c("geno","dataset"),  
+                     assay="SCT", ident_column = "predicted.celltype",
+                     random.effects = c("orig.ident","hash.mcl.ID"), 
+                     d = 20)
+```
+
+
+```{r}
+pb <- pseudobulk_lepip[["Agrp"]]
+pb <- pb[,pb$samples$dataset=="lepip"&pb$samples$time!=24]
+colnames(pb) <- paste0(colnames(pb), "_", pb$samples$time)
+pb$samples$geno <- factor(pb$samples$geno, levels=c("wt","mut"))
+pb$samples$treatment <- factor(pb$samples$treatment, levels=c("Sal","Lep"))
+pb$samples$time <- factor(pb$samples$time, levels=c("1","3","6"))
+design <-  model.matrix(~geno + time + treatment + geno:treatment+hash_pool, data=pb$samples)
+colnames(design) <- gsub(":", "_", colnames(design))
+colnames(design) <- gsub("\\(", "", colnames(design))
+colnames(design) <- gsub("\\)", "", colnames(design))
+fit <- voomLmFit(pb, design)
+# Create a contrast matrix for both tests
+contrasts <- makeContrasts(
+    Mut_Leptin = treatmentLep + genomut_treatmentLep,
+    WT_Leptin = treatmentLep,
+    Mut_vs_WT = genomut_treatmentLep,
+levels = design)
+fit2 <- contrasts.fit(fit, contrasts)
+fit2 <- eBayes(fit2, robust=T)
+alldeg <- topTable(fit2,n=Inf, p=0.1)  
+filtdeg <- alldeg[abs(alldeg$Mut_Leptin) > 0.5 | abs(alldeg$WT_Leptin) > 0.5 | abs(alldeg$Mut_vs_WT) > 0.5, ]
+
+pb <- pseudobulk_lepip[["Agrp"]]
+colnames(pb) <- paste0(colnames(pb), "_", pb$samples$time)
+logcpm <- edgeR::cpm(pb, prior.count=5, log=T)
+logcpm <- limma::removeBatchEffect(logcpm, batch=pb$samples$hash_pool,
+                                design = model.matrix(~geno + time + treatment + geno:treatment, data=pb$samples))
+                                
+expr_data <- t(scale(t(logcpm[rownames(logcpm) %in% rownames(filtdeg),])))
+gene_hclust <- hclust(dist(expr_data), method="ward.D2")
+plot(gene_hclust)
+dev.off()
+clusters <- cutree(gene_hclust, k = 4)
+table(clusters)
+
+df <- bind_cols(data.frame(expr_data, check.names=F), enframe(clusters)) %>% 
+     pivot_longer(c(-name, -value), names_to = "sample", values_to = "expression") %>% 
+    separate(sample, into  = c("hash.mcl.ID", "geno", "treatment", "time"), sep = "_")
+
+df %>% 
+    group_by(value, time, treatment, geno)  %>% 
+    mutate(mean = mean(expression))  %>% 
+    group_by(value, name)  %>% 
+    mutate(cor = cor(expression, mean))  %>%  distinct(name, .keep_all=T)  %>% 
+    arrange(value, -cor)  %>% 
+    dplyr::select(name, treatment, time,geno, cor)  %>% 
+    group_by(value)  %>% 
+    dplyr::top_n(10)  %>%  print(n=50)
+   
+agrp_timeplot <- df %>% 
+    group_by(value, time, treatment, geno, hash.mcl.ID) %>% 
+    summarise(mean = mean(expression)) %>%
+    ggplot() +
+    aes(factor(time,c(1,3,6,24)), mean,
+         group = interaction(treatment, geno), color = interaction(treatment), lty = geno) +
+    stat_summary(geom="point", size=0.5) +
+    stat_summary(geom = "line", aes(color=interaction(treatment), lty = geno), size=0.25) +
+    facet_wrap(~value, ncol=1, scales="free_y", switch = "y")  +
+    scale_color_manual(values = c("Lep" = "red", "Sal" = "black")) +
+    theme(axis.line = element_line(color='black'),panel.background = element_blank(), text = element_text(size=6, face="bold"), line = element_line(linewidth=0.25),
+         plot.background = element_blank(), panel.grid.major = element_blank(),
+         panel.grid.minor = element_blank(), panel.border = element_blank(),strip.text = element_text(colour = 'black'),
+         strip.background = element_rect(fill="white"), strip.placement = "outside") +
+    labs(x=NULL, y=NULL, color=NULL) +
+    scale_x_discrete(expand = c(0.05, 0))
+
+ggsave("a.pdf", plot = agrp_timeplot, h=5, w=2)
+
+totest <- distinct(df, name, .keep_all=T)
+lepdf <- purrr::map_dfr(split(totest$name,f=totest$value), function(x) {
+    genes_converted <- data.frame(convert_mouse_to_human(out$gene))
+    genes_entrez <- AnnotationDbi::select(org.Hs.eg.db,
+                        keys = genes_converted$X2,
+                        columns = c("ENTREZID", "SYMBOL"),
+                        keytype = "SYMBOL")
+    return(genes_entrez)
+    }, .id="group")
+
+write.table(lepdf, file="../magma_genesets/agrp_gene_sets_lep.txt", sep = "\t", quote=F, row.names=F)
+```
+
+
+```{r}
+DefaultAssay(arc_lepip) <- "RNA"
+arc_lepip <- AddModuleScore(arc_lepip, features = list(metagenes))
+arc_lepip[[]] %>% 
+    filter(predicted.celltype %in% lepclus)  %>% 
+    ggplot() +
+    aes(x=predicted.celltype, y=Cluster1, fill=treatment) +
+    geom_boxplot() +
+    facet_wrap(~geno)
+dev.off()
+```
+
+```{r}
+obwt_celldist$results  %>% 
+    rownames_to_column("ct")  %>% 
+    mutate(geno = "obwt")  %>% 
+    bind_rows(
+        lepip_celldist$results  %>% 
+            rownames_to_column("sample")  %>% 
+            separate(sample, into=c("ct", "geno"))
+    )  %>% 
+    arrange(Dist.)  %>% 
+    mutate(lepr = ifelse(ct %in% c("Agrp","12","26","29","28"), "lepr", "low"))  %>% 
+    filter(lepr == "lepr")
+    ggplot() +
+    aes(x=geno, y=Dist., fill=lepr) +
+    geom_boxplot() +
+    geom_point()
+dev.off()
+```
+
+
+```{r}
+plot  %>% rownames_to_column("group")  %>%
+    mutate(ct = celltypes)  %>% 
+    filter(n>30) %>%
+    pivot_longer(c("fast","hfd"))  %>% 
+    mutate(color = ifelse(ct %in% lepclus, "lep","no"))  %>% 
+    ggplot() +
+    aes(x=name, value) +
+    geom_boxplot() +
+    geom_point(position = position_jitter(w = 0.1, h = 0, seed = 123), size = 1.5) +
+    geom_hline(yintercept=0, lty=2) +
+    theme_classic() +
+    lims(y=c(-0.9,0.9)) +
+    labs(x=NULL, y="Correlation")
+
+ggsave("a.pdf", h=4, w=2)
+```
+
+
+
+
+```{r}
+pbdob <-  edger_prep(subset(arc_lepip_labeled, subset = geno == "ob"), celltype_column = "seurat_clusters", trt_group = "treatment", celltypes = "Agrp")
+design <-  model.matrix(~treatment+hash_pool, data=pbdob$samples)
+colnames(design) <- gsub(":", "_", colnames(design))
+fitob <- voomLmFit(pbdob, design)
+fitob <- eBayes(fitob, robust=F)
+obdeg <- topTable(fitob, coef=2, n=Inf) 
+inner_join(obdeg, alldeg, by="gene")  %>% filter(adj.P.Val.x<0.05|adj.P.Val.y<0.05)  %>%  summarise(cor = cor(logFC, treatmentHFD))  %>% head
+```
+
+
+```{r}
+compare_result <- compareCluster(gene~name, 
+    data= clustered_degs,
+    fun = "enrichGO",
+    OrgDb = org.Mm.eg.db,
+    ont = "ALL",
+    keyType = "SYMBOL",
+    pvalueCutoff = 0.05,
+    universe = rownames(pbd$counts)
+  )
+
+topgo <- simplify(
+  ego,
+  cutoff = 0.5,
+  by = "p.adjust",
+  select_fun = min,
+  measure = "Wang",
+  semData = NULL
+)
+
+topgo@result %>% filter(qvalue<0.05) %>% arrange(qvalue)  %>% tail(50)
+
+km <- kmeans(hmapscale, centers=5)
+broom::augment(km, hmapscale)  %>% pivot_longer(-contains("."))  %>% 
+    data.frame()  %>% 
+    separate(name, into=c("hash", "diet"))  %>% 
+    mutate(diet = gsub("cluster","",diet))  %>% 
+    group_by(.cluster)  %>% 
+    mutate(mean = mean(value[diet=="Chow"]))  %>% 
+    mutate(centered = value-mean)  %>% 
+    ggplot() +
+    aes(x=.cluster, y=centered, fill=fct_relevel(diet, c("HFD", "Chow", "Refeed", "Fast"))) +
+    geom_boxplot() +
+    facet_wrap(~.cluster, nrow=1,scale="free_x") +
+    scale_fill_manual(values=my_colors) + theme_bw() +
+    labs(fill="Diet")
+
+ggsave("a.pdf", h=2, w=8)
+goenrich <- 
+    lapply(unique(km$cluster), function(x) {
+        genes <- names(km$cluster)[km$cluster==x]
+        ego <- enrichGO(gene          =  genes,  keyType       = 'SYMBOL',
+                universe      = rownames(pbd),maxGSSize=500, minGSSize=5,
+                OrgDb         = org.Mm.eg.db,
+                ont           = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.05,
+                qvalueCutoff  = 0.05,
+                readable      = TRUE)
+        return(ego@result)
+})
+names(goenrich) <- unique(km$cluster)
+goenrich[["1"]][,1:8]
+```
+
+```{r}
+deg.list <- lapply(c("8","Agrp","31","32","19"), function(x) {
+    pbd <-  edger_prep(diet_neurons, celltype_column = "mergeagrp", trt_group = "treatment", celltypes = x)
+    pbd$samples$treatment <- factor(pbd$samples$treatment, levels=c("Chow", "HFD", "Refeed", "Fast"))
+    design <-  model.matrix(~treatment+hash_pool, data=pbd$samples)
+    colnames(design) <- gsub(":", "_", colnames(design))
+    fitd <- voomLmFit(pbd, design)
+    fitd <- eBayes(fitd, robust=T)
+    diodeg <- topTable(fitd, coef=2, n=Inf, sort="p")  %>%  mutate(group = "dio")
+    fastdeg <- topTable(fitd, coef=4, n=Inf, sort="p")  %>%  mutate(group = "fast")
+    deg <- bind_rows(diodeg, fastdeg)
+    return(deg)
+})
+
+scores <- alldeg$treatmentHFD*(-log10(alldeg$P.Value))
+names(scores) <- alldeg$gene
+scores <- sort(scores, decreasing=T)        
+        ego <- gseGO(gene          =  scores,  keyType       = 'SYMBOL', minGSSize=10,
+                OrgDb         = org.Mm.eg.db,
+                ont           = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.05)
+ego@result
+
+bind_rows(deg.list, .id="ct")  %>% 
+ filter(group == "dio")  %>%  
+ group_by(gene)  %>% 
+ filter(ct %in% c(1,2))  %>% 
+ mutate(totsig = sum(adj.P.Val<0.05))  %>% 
+ filter(totsig>0)  %>% 
+ dplyr::select(gene, logFC, ct)  %>% 
+ pivot_wider(names_from=ct, values_from=logFC)  %>% 
+ ggplot() +
+ aes(`1`,`2`) + ggrepel::geom_text_repel(aes(label=gene)) +
+ geom_point() + coord_equal() 
+dev.off()
+
+fastdeg
+fit2 <- contrasts.fit(fitd, c(0,0,1,-1,0))
+fit2 <- eBayes(fit2, robust=F)
+refdeg <- topTable(fit2, n=Inf, sort="p")
+head(refdeg, n=10)
+lepdf <- data.frame(fast = fastdeg[metagenes,"logFC"], dio = diodeg[metagenes,"logFC"], 
+    gene = metagenes)  %>% column_to_rownames("gene")
+lepdf[lepdf>3] <- 3
+lepdf[lepdf < -3] <- -3
+pdf("hmap.pdf",h=3, w=2)
+Heatmap(lepdf, show_row_dend=F, show_column_names=F, cluster_rows=F, 
+    rect_gp = gpar(col = "black", lwd = 1),
+    cluster_columns=F, na_col="white")
+dev.off()
+```
+```{r}
+library(scDist)
+cts <- names(table(diet_neurons$mergeagrp))[table(diet_neurons$mergeagrp) > 200]
+
+hfdveh_celldist <- 
+    subset(diet_neurons, subset = treatment %in% c("Chow", "HFD") & mergeagrp %in% cts) %>% 
+          run_scdist(obj = ., fixed.effects = c("treatment", "hash_pool"), assay = "SCT", ident_column = "mergeagrp", 
+                   random.effects = c("orig.ident","hash.mcl.ID"), d = 20)
+fastveh_celldist <- 
+    subset(diet_neurons, subset = treatment %in% c("Chow", "Fast") & mergeagrp %in% cts) %>% 
+          run_scdist(obj = ., fixed.effects = c("treatment", "hash_pool"), assay = "SCT", ident_column = "mergeagrp", 
+                   random.effects = c("orig.ident","hash.mcl.ID"), d = 20)
+
+
+```
+
+```{r}
+outfast  %>% mutate(comp = "Fast-Chow") %>%  
+    bind_rows(outdio  %>% mutate(comp = "HFD-Chow")) %>% 
+    #bind_rows(outref  %>%  mutate(comp = "Refeed-Fast"))  %>% 
+    filter(mergeagrp %in% lepclus)  %>% 
+    ggplot() +
+    aes(mergeagrp, estimate, color=contrast) +
+    geom_point()
+dev.off()
+```
+
+
+```{r}
+
+df2 <- map_dfr(unique(diet_neurons$seurat_clusters)[1:40], function(x) {
+    data = diet_neurons[[]][diet_neurons$seurat_clusters==x,]  %>% filter(treatment %in% c("Chow", "HFD"))
+    roc_curve <- auc(roc(data$treatment, data$Cluster1))
+    permuted_aucs <- replicate(100, calculate_permuted_auc(data))
+    pval = mean(permuted_aucs >= roc_curve)
+    class(roc_curve)
+    data.frame(mean = pval, clus = x, roc = roc_curve[[1]], n = length(data$Cluster2))
+})
+
+VlnPlot(diet_neurons, "Cluster1", split.by="treatment")
+ggsave("a.pdf", h=3, w=10)
+df2  %>% arrange(roc)  %>% filter(n>100)
+roc_curve <- roc(diet_neurons$treatment[diet_neurons$seurat_clusters==22], diet_neurons$Cluster1[diet_neurons$seurat_clusters==22], levels=c("HFD", "Chow"))
+DimPlot(diet_neurons, label=T) + NoLegend()
+```
+
+```{r}
+diet_neurons <- process_seurat(arc_diet, method = "integrate", batch = "orig.ident", res = 1, dims = 30)
+DefaultAssay(campbell_scrna.map) <- "RNA"
+campbell_scrna.map <- AddModuleScore_UCell(campbell_scrna.map, features=list(myers = gene_names, ahit = lpe_ahituv))
+
+VlnPlot(diet_neurons, "Cluster1", split.by="treatment")
+ggsave("a.pdf", w=10)
+diet_lepr <- process_seurat(subset(diet_neurons, Lepr>0), method = "integrate", batch = "orig.ident", res = 0.8, dims = 20)
+lepr_exp <- AverageExpression(diet_neurons, "Lepr", assay="RNA")
+DimPlot(diet_lepr, label=T)#, cells.highlight=WhichCells(diet_neurons, idents=c(which(lepr_exp$RNA>0.7)-1))) + NoLegend()
+ggsave("a.pdf")
+```
+
+```{r}
+DefaultAssay(arc_diet_labeled) <- "RNA"
+VlnPlot(arc_diet_labeled, "Nlrc5", split.by="treatment", pt.size=0)
+DimPlot(diet_lepr, group.by="treatment", label=T)
+ggsave("a.pdf", w=10)
+```
+```{r}
+inner_join(diodeg, diodeg, by="gene")  %>% 
+    filter(adj.P.Val.x<0.05|adj.P.Val.y<0.05)  %>% 
+    ggplot() +
+    aes(logFC.x, logFC.y) +
+    geom_point()
+```
+```{r}
+Idents(arc_diet_labeled) <- "predicted.celltype"
+FeaturePlot(arc_diet_labeled, "Socs3", label=T)
+ggsave("a.pdf")
+```
+
+```{r}
+BiocManager::install("dreamlet")
+```
+
+```{r}
+library(ComplexHeatmap)
+pbd <-  edger_prep(diet_neurons, celltype_column = "mergeagrp", trt_group = "treatment", celltypes = "32")
+pbd$samples$treatment <- factor(pbd$samples$treatment, levels=c("HFD", "Chow", "Refeed", "Fast"))
+design <-  model.matrix(~treatment+hash_pool, data=pbd$samples)
+colnames(design) <- gsub(":", "_", colnames(design))
+fitd <- voomLmFit(pbd, design)
+hmapdat <- cpm(pbd, prior.count=5, log=T)[rownames(cpm(pbd, prior.count=5, log=T)) %in% metagenes,]
+hmapscale <- t(scale(t(hmapdat)))
+hmapscale[hmapscale>2] <- 2
+hmapscale[hmapscale < -2] <- -2
+pdf("hmap.pdf",h=3, w=4)
+Heatmap(hmapscale[,order(pbd$samples$treatment)], show_row_dend=F, show_column_names=F, cluster_rows=F, cluster_columns=F)
+dev.off()
+
+fitd <- eBayes(fitd, robust=F)
+fastdeg <- topTable(fitd, coef=4, n=Inf)   
+diodeg <- topTable(fitd, coef=2, n=Inf, sort="p")
+
+fit2 <- contrasts.fit(fitd, c(0,0,1,-1,0))
+fit2 <- eBayes(fit2, robust=T)
+refdeg <- topTable(fit2, n=Inf, sort="p")
+head(refdeg, n=10)
+
+rank <- diodeg$t[order(-diodeg$t)]
+names(rank) <- diodeg$gene[order(-diodeg$t)]
+head(rank, n=20)
+fgseaRes <- fgsea(pathways = list("myers" = gene_names,  "ahit" = lpe_ahituv, "wp" = wp_human), 
+                  stats    = rank,
+                  maxSize  = 500)
+
+
+fastdeg
+
+head(fastdeg, n=25)
+inner_join(fastdeg, diodeg, by="gene")  %>% filter(adj.P.Val.x<0.05|adj.P.Val.y<0.05)  %>% summarise(cor = cor(logFC.x, logFC.y))
+ggplot() +
+aes(logFC.x, logFC.y) +
+    geom_point()
+ggsave("a.pdf")
+fit2 <- contrasts.fit(fit, c(0,0,1,-1,0))
+fit2 <- eBayes(fit2, robust=T)
+topTable(fit2, n=Inf, p=0.05)
+perform_fisher_test(ref_deg, rv_mouse)
+perform_hypergeometric_test(ref_deg, rv_mouse)
+```
+```{r}
+p1 <- DimPlot(arc_lepip_labeled, group.by=c("geno"), raster=T, cols = cols_by_geno)
+p2 <- DimPlot(arc_diet_labeled, group.by=c("treatment"), reduction="ref.umap", raster=T, pt.size=2, cols = cols_by_diet)
+ggsave("a.pdf", plot = p1+p2 & theme_void() & NoLegend() & ggtitle(NULL), h=3, w=6)
+```
+
+```{r}
+mapping_df <- data.frame(arc_diet_labeled@reductions$ref.umap@cell.embeddings)  %>% 
+    mutate(diet = arc_diet_labeled$treatment, dataset="diet")  %>% 
+    bind_rows(arc_lepip_labeled@reductions$umap@cell.embeddings %>% data.frame()  %>% dplyr::sample_frac(0.2)  %>% mutate(dataset = "lepip")  %>% 
+            dplyr::rename("refUMAP_1" = UMAP_1, "refUMAP_2" = UMAP_2)) 
+
+bg_plot <- ggplot(mapping_df[mapping_df$dataset=="lepip",]) +
+    aes(refUMAP_1, refUMAP_2) +
+    geom_point(shape=".", alpha=0.1, color="grey70") +
+    theme_void() + coord_equal()
+
+bg_plot + geom_point(data = mapping_df[mapping_df$diet=="HFD",], color=cols_by_diet[2], size=0.15) + geom_point(data = mapping_df[mapping_df$diet=="Fast",], color=cols_by_diet[1], size=0.15) + 
+    geom_point(data = mapping_df[mapping_df$diet=="Refeed",], color=cols_by_diet[3], size=0.15) 
+ggsave(paste0(fig_path_3, "diet_umap.pdf"), h=5, w=5)
+```
+
+```{r}
+df <- data.frame(arc_diet_labeled@reductions$ref.pca@cell.embeddings)  %>% mutate(clus = arc_diet_labeled$predicted.celltype, group = arc_diet_labeled$treatment)  %>% 
+    bind_rows(data.frame(arc_lepip_labeled@reductions$pca@cell.embeddings[arc_lepip_labeled$treatment == "Sal",1:30])  %>%  rename_with(~ gsub("PC", "refpca", .x, fixed = TRUE))  %>% 
+                mutate(clus = arc_lepip_labeled$seurat_clusters[arc_lepip_labeled$treatment == "Sal"], group = arc_lepip_labeled$geno[arc_lepip_labeled$treatment == "Sal"]))  %>% 
+    filter(group %in% c("mut", "Fast", "HFD","Chow"))  %>% 
+    pivot_longer(starts_with("ref"))  %>% 
+    group_by(clus, group, name)  %>%
+    summarise(mean = mean(value)) %>% 
+    pivot_wider(names_from=name, values_from=mean)  %>% 
+    data.frame()
+
+test <- df  %>% filter(clus %in% c(0,8,27,2,16,5,12)) 
+
+mat <- test[,3:ncol(test)]
+distmat <- dist(mat, method="man")
+hc<- hclust(distmat)
+clus <- levels(factor(test$clus)[order.dendrogram(dend)])
+
+
+dend <- as.dendrogram(hc, method="complete")
+dend <- color_branches(dend, k=7) %>% set("branches_lwd", 3) 
+dend <- hang.dendrogram(dend,hang_height=0.1)
+labels(dend) <- paste0(test$group)[order.dendrogram(dend)]
+#labels(dend) <- rep(c("HFD","WT", "Fast", "Mut"),3)
+pdf(paste0(fig_path_3, "diet_dend.pdf"), h=6, w=8)
+par(mar = c(3,3,3,25))
+plot(sort(dend), horiz=T)
+colored_bars(colors = test$clus, dend = sort(dend), sort_by_labels_order = FALSE, horiz=T,  rowLabels = "CellType")
+dev.off()
+```
+
+```{r}
+targets::tar_load(fastveh_celldist)
+targets::tar_load(hfdveh_celldist)
+
+
+fastveh_celldist <- fastveh_celldist %>% janitor::clean_names() %>% rownames_to_column("clus")  %>% dplyr::select(clus, dist, x95_percent_ci_low, x95_percent_ci_upper)
+hfdveh_celldist <- hfdveh_celldist %>% janitor::clean_names() %>% rownames_to_column("clus")  %>% dplyr::select(clus, dist, x95_percent_ci_low, x95_percent_ci_upper)
+
+# Merging on clus
+merged_df <- merge(fastveh_celldist, hfdveh_celldist, by="clus", suffixes = c("_mut", "_wt"))
+
+# Plotting
+p <- ggplot(merged_df, aes(x=dist_mut, y=dist_wt)) +
+  geom_errorbar(aes(ymin=x95_percent_ci_low_wt, ymax=x95_percent_ci_upper_wt), width=0) +
+  geom_errorbarh(aes(xmin=x95_percent_ci_low_mut, xmax=x95_percent_ci_upper_mut), height=0) +
+  geom_point(size=3) +
+  geom_abline(lty=2) +
+  ggrepel::geom_text_repel(aes(label = clus)) +
+  labs(x="Fasting Effect", y="HFD Effect") +
+  theme_classic() +
+  lims(x=c(0,45),y=c(0,35))
+
+p
+ggsave(paste0(fig_path_3, "diet_celldist.pdf"), h=5, w=5, plot = p + coord_equal())
+```
+
+```{r}
+targets::tar_load(fit_diet)
+
+sig_res_fast <- purrr::map(fit_diet, function(x) {
+    res <- topTags(glmLRT(x, coef=2), n=Inf)  %>%  data.frame()
+    return(res)
+})
+
+sig_res_dio <- purrr::map(fit_diet, function(x) {
+    res <- topTags(glmLRT(x, coef=3), n=Inf)  %>%  data.frame()
+    return(res)
+})
+
+sig_res_refeed <- purrr::map(fit_diet, function(x) {
+    res <- topTags(glmLRT(x, contrast = c(0,-1,0,1,0)), n=Inf)  %>%  data.frame()
+    return(res)
+})
+
+sig_res_all <- purrr::map(fit_diet, function(x) {
+    res <- topTags(glmLRT(x, coef=2:4), p=1e-2, n=Inf)  %>%  data.frame()
+    return(res)
+})
+
+tar_load(fit_glp1rko)
+
+dds_diet <- purrr::map(fit_diet, function(x) {
+    rownames(x$samples) <- colnames(x$counts)
+    dds <- DESeqDataSetFromMatrix(countData = x$counts, colData = x$samples, 
+                            design = ~ treatment + hash_pool)
+    return(dds)
+})
+
+vsd_diet <- purrr::map(dds_diet, function(x) {
+    vsd <- vst(x, blind=F)
+    assay(vsd) <- limma::removeBatchEffect(assay(vsd), batch = vsd$hash_pool, 
+                   design = model.matrix(~treatment, data = colData(vsd)))
+    return(vsd)
+})
+
+
+names <- purrr::map(fit_diet, ~unique(.x$samples$predicted.celltype))
+names(fit_diet) <- names
+names(vsd_diet) <- names
+names(sig_res_fast) <- names
+names(sig_res_dio) <- names
+names(sig_res_refeed) <- names
+
+demats <- list("Fast v Chow" = sig_res_fast, "HFD v Chow" = sig_res_dio, "refeed" = sig_res_refeed)
+```
+
+```{r}
+norm_mat_diet <- purrr::map2(sig_res_all[idx], vsd_diet[idx], function(x,y) {
+    mat <- t(scale(t(assay(y)[x$gene,])))
+    control_columns <- grepl("Chow", colnames(mat))
+    # Calculate the average expression for each control group
+    control_avg <- rowMeans(mat[, control_columns], na.rm = TRUE)
+    # Subtract the control average from each column in the dataframe
+    df_diff <- sweep(mat, 1, control_avg, `-`)
+    return(df_diff)
+}) 
+
+dim(norm_mat_diet[[3]])
+```
+
+# Glp1r Analysis
+```{r}
+ct <- 1
+cormat <- dist(norm_mat_diet[[ct]])
+gene_hclust <- hclust(cormat, method="ward")
+dend <-  as.dendrogram(gene_hclust) 
+
+
+pdf("a.pdf")
+plot(dend)
+n = nrow(norm_mat_diet[[ct]])
+MidPoint = (gene_hclust$height[n-k] + gene_hclust$height[n-k+1]) / 2
+abline(h = MidPoint, lty=2)
+dev.off()
+
+clusters <- cutree(gene_hclust, k = 7)
+table(clusters)
+
+df <- bind_cols(data.frame(norm_mat_diet[[ct]], check.names=F), enframe(clusters)) %>% 
+      pivot_longer(c(-name, -value), names_to = "sample", values_to = "expression") %>% 
+      separate(sample, into  = c("hash.mcl.ID", "diet"), sep = "_")
+   
+
+df %>% 
+    group_by(value, diet)  %>% 
+    mutate(mean = mean(expression))  %>% 
+    group_by(value, name)  %>% 
+    mutate(cor = cor(expression, mean))  %>%  distinct(name, .keep_all=T)  %>% 
+    filter(value==1)  %>% arrange(desc(cor))
+    dplyr::select(name, diet, cor)  %>% 
+    print(n=40)
+
+hmap <- df %>% 
+    group_by(value, diet) %>% 
+    summarise(mean = mean(expression)) %>%
+    pivot_wider(names_from=value, values_from=mean)  %>% 
+    data.frame()
+
+rownames(hmap) <- hmap$diet
+hmap <- hmap[-1,-1]
+
+pdf("a.pdf", h=2, w=1.5)
+Heatmap(t(hmap), col=colorRamp2(c(min(hmap),0, max(hmap)),c("blue", "white", "red")), 
+    border = TRUE, show_row_dend = F, show_column_dend=F,
+    row_names_gp = gpar(fontsize = 6), column_names_gp = gpar(fontsize = 6))
+dev.off()
+
+pdf("a.pdf")
+df %>% 
+    group_by(value, diet, hash.mcl.ID) %>% 
+    summarise(mean = mean(expression)) %>%
+    ggplot() +
+    aes(diet, mean, fill = diet) +
+    geom_boxplot() +
+    facet_wrap(~value, scales="free_y")
+
+ggsave("a.pdf")    
+
+    stat_summary(geom="point", size=0.5) +
+    stat_summary(geom = "line", aes(color=interaction(treatment), lty = geno), size=0.25) +
+    facet_wrap(~value, ncol=1, scales="free_y", switch = "y")  +
+    scale_color_manual(values = c("Lep" = "red", "Sal" = "black")) +
+    theme(axis.line = element_line(color='black'),panel.background = element_blank(), text = element_text(size=6, face="bold"), line = element_line(linewidth=0.25),
+         plot.background = element_blank(), panel.grid.major = element_blank(),
+         panel.grid.minor = element_blank(), panel.border = element_blank(),strip.text = element_text(colour = 'black'),
+         strip.background = element_rect(fill="white"), strip.placement = "outside") +
+    labs(x=NULL, y=NULL, color=NULL) +
+    scale_x_discrete(expand = c(0.05, 0)) +
+    NoLegend()
+
+ggsave("a.pdf", plot = glpr_time, h=4, w=2)
+```
+```
+
+```{r}
+idx <- names %>% 
+    enframe()  %>% 
+    unnest(value)  %>% 
+    rownames_to_column("idx")  %>% 
+    filter(value %in% c(0,27,8)) %>%
+    pull(idx) %>%
+    as.numeric()
+
+names(idx) <- c(0,27,8)
+
+purrr::map_dfr(idx, function(x) purrr::map_dfr(demats, function(y) y[[x]][selected_genes,], .id="trt"), .id="ct")  %>% 
+   filter(trt!="refeed")  %>% 
+    ggplot() +
+    aes(ct, logFC) +
+    ggbeeswarm::geom_quasirandom(width=0.2, size=1, aes(color= I(ifelse(FDR<0.05, "red","grey80"))), alpha=0.5) +
+    stat_summary(geom="crossbar", fun="mean", aes(y = logFC), linewidth=0.1, width=0.5)  +
+    geom_hline(yintercept=0, lty=2) +
+    facet_wrap(~trt, ncol=1, scales="free_y") +
+    ggrepel::geom_text_repel(aes(label = ifelse(grepl("Fos", gene)&FDR<0.05, gene, NA_character_)), max.overlap=1, size=2) +
+    theme_bw()
+
+ggsave(paste0(fig_path_3,"ieg.pdf"), h=3, w=1.5)
+```
+
+
+```{r}
+df <- data.frame(sig_res_fast[["8"]]) %>% mutate(diet="fast") %>% 
+    bind_rows(
+        sig_res_dio[["8"]]  %>% mutate(diet="HFD")
+    )  %>% 
+     bind_rows(
+        sig_res_refeed[["8"]] %>% mutate(diet="Refeed")
+    )  
+
+head(df)
+
+    bind_rows(
+        data.frame(sig_res_fast[["0"]])  %>% 
+    inner_join(
+        sig_res_dio[["0"]], by="gene"
+    )  %>% 
+    mutate(clus="0")
+    )  %>% 
+    bind_rows(
+        data.frame(sig_res_fast[["8"]])  %>% 
+    inner_join(
+        sig_res_dio[["8"]], by="gene"
+    )  %>% 
+    mutate(clus="8")
+    )
+
+fast_genes <- df %>% group_by(diet)  %>% filter(FDR<1e-3 &  abs(logFC)>1) %>% 
+     dplyr::slice_min(n=10, FDR)  %>%  ungroup()  %>% distinct(gene)  %>% pull(gene)
+
+hmap <- df[df$gene %in% fast_genes, c("gene", "diet","logFC")]  %>% 
+    pivot_wider(names_from = diet, values_from = logFC)  %>% data.frame()
+
+hmap[is.na(hmap)] <- 0
+hmap <- hmap[match(fast_genes, hmap$gene),]
+rownames(hmap) <- hmap$gene
+
+pdf("a1.pdf", h=4, w=2.5)
+Heatmap(hmap[,-1], col=colorRamp2(c(-4,0, 4),c("blue", "white", "red")), row_names_gp = gpar(fontsize = 6), column_names_gp = gpar(fontsize = 6))
+dev.off()
+
+
+dio_genes <- df %>% select(gene, ends_with(".y"), clus)  %>% group_by(clus)  %>% filter(FDR.y<1e-3 &  abs(logFC.y)>1 & logCPM.y > 3) %>% 
+     dplyr::slice_min(n=10, FDR.y)  %>%  ungroup()  %>% distinct(gene)  %>% pull(gene)
+
+hmap <- df[df$gene %in% dio_genes, c("gene", "clus","logFC.y")]  %>% 
+    pivot_wider(names_from = clus, values_from = logFC.y)  %>% data.frame()
+
+hmap[is.na(hmap)] <- 0
+hmap <- hmap[match(dio_genes, hmap$gene),]
+rownames(hmap) <- hmap$gene
+
+
+pdf("a2.pdf", h=4, w=2.5)
+Heatmap(abs(hmap[,-1]), col=colorRamp2(c(-3, 0, 3),c("blue", "white", "red")), row_names_gp = gpar(fontsize = 6), column_names_gp = gpar(fontsize = 6))
+dev.off()
+```

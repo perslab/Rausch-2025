@@ -1,0 +1,1299 @@
+```{r}
+library(Seurat)
+library(targets)
+library(tidyverse)
+library(edgeR)
+library(DESeq2)
+library(org.Mm.eg.db)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(ggVennDiagram)
+library(ReactomePA)
+library(ggVennDiagram)
+library(dynamicTreeCut)
+library(patchwork)
+library(ComplexHeatmap)
+library(magrittr)
+
+targets::tar_load(celltypes)
+targets::tar_load(pseudobulk_lepip)
+targets::tar_load(arc_lepip)
+targets::tar_load(arc_diet_labeled)
+
+source("R/analysis_wrappers.R")
+source("R/basic_processing.R")
+source("R/helper_functions.R")
+
+# Helper function to calculate mean and standard deviation
+mean_sd <- function(x) {
+  data.frame(y = mean(x),
+             ymin = mean(x) - sd(x),
+             ymax = mean(x) + sd(x))
+}
+
+
+names(pseudobulk_lepip) <- celltypes
+fig_path_3 <- here::here("output_figures/figure3/")
+```
+
+```{r}
+DefaultAssay(arc_diet_labeled) <- "RNA"
+lepr_exp <- AverageExpression(arc_diet_labeled, features="Lepr", group.by="seurat_clusters")
+lepclus <- names(as.data.frame(lepr_exp$RNA))[which(lepr_exp$RNA>1)]
+```
+
+```{r}
+df <- data.frame(arc_diet_labeled@reductions$pca@cell.embeddings[,1:30])  %>% mutate(clus = arc_diet_labeled$seurat_clusters, group = arc_diet_labeled$treatment)  %>% 
+    rename_with(~ gsub("PC", "refpca", .x, fixed = TRUE))  %>% 
+    bind_rows(data.frame(arc_lepip@reductions$ref.pca@cell.embeddings[arc_lepip$treatment == "Sal",]) %>% 
+                mutate(clus = arc_lepip$predicted.celltype[arc_lepip$treatment == "Sal"], group = arc_lepip$geno[arc_lepip$treatment == "Sal"]))  %>% 
+    filter(group %in% c("mut", "Fast", "HFD","Chow"))  %>% 
+    pivot_longer(starts_with("ref"))  %>% 
+    group_by(clus, group, name)  %>%
+    summarise(mean = mean(value)) %>% 
+    pivot_wider(names_from=name, values_from=mean)  %>% 
+    data.frame()
+
+test <- df  %>% filter(clus %in% lepclus) 
+mat <- test[,3:ncol(test)]
+distmat <- dist(mat)
+hc<- hclust(distmat,  method="ward.D2")
+clus <- levels(factor(test$clus)[order.dendrogram(dend)])
+
+
+library(dendextend)
+dend <- as.dendrogram(hc)
+dend <- color_branches(dend, k=7) %>% set("branches_lwd", 3) 
+dend <- hang.dendrogram(dend)
+labels(dend) <- paste0(test$group)[order.dendrogram(dend)]
+#labels(dend) <- rep(c("HFD","WT", "Fast", "Mut"),3)
+pdf(paste0(fig_path_3, "diet_dend.pdf"), h=6, w=8)
+par(mar = c(3,3,3,25))
+plot(dend, horiz=T)
+#colored_bars(colors = test$clus, dend = sort(dend), sort_by_labels_order = FALSE, horiz=T,  rowLabels = "CellType")
+dev.off()
+```
+
+```{r}
+diet_deg <- data.table::fread(here::here("results/diet_pairwise_deg.csv"))  %>% as.data.frame()
+
+metagenes <- c("Socs3", "Atf3", "Etv6", "Timp1", "Serpina3i", "Nlrc5", "Gpr151", "Rdh10",
+                 "Arid5a", "Steap4", "Sbno2", "Serpina3n", "Cpne8", "Gucy2c")
+expanded_metagenes <- c(
+  "Socs3", "Atf3", "Etv6", "Serpina3i", "Sbno2", "Arid5a", "Rdh10", "Cpne8", "Serpina3n", "Drd1",
+  "Socs2", "Gucy2c", "Prokr2", "Cd24a", "Nedd9", "Gch1", "Vwa5a", "Tnfrsf11b", "Gcnt2", "Jun",
+  "Asb4", "Irf9", "Stat3", "Gadd45g", "Thbd", "Traf3ip3", "Trim62", "Lamc2", "St18", "Stat2",
+  "Fam210b", "Nptx2", "Txnrd1", "Ikzf4", "Man1c1", "Cish", "Pros1", "Arid5b", "Palmd", "Shb",
+  "Iqgap2", "Man2a1", "Parp3", "Khdrbs3", "Gnal", "Prkar2b"
+)
+
+enrichGO
+
+
+# Function to get top and bottom 10 genes for a group
+get_top_bottom_n <- function(group, n) {
+  total_rows <- nrow(group)
+  return(group %>%
+    arrange(desc(t)) %>%
+    slice(c(1:n, (total_rows-n+1):total_rows)))
+}
+
+# Group by 'ct' and 'comp', then get top and bottom 10 for each group
+result <- diet_deg %>%
+  group_by(ct, comp) %>%
+  do(get_top_bottom_n(.,50)) %>%
+  ungroup()  %>% 
+  mutate(group = interaction(ct, comp, sign(logFC)))  %>% 
+  group_by(group)
+
+group_list <-  result  %>% 
+  group_split()  %>% 
+  purrr::map("gene")
+
+group_names <- result %>% 
+  group_keys() %>% 
+  pull(group)
+
+gene_sets <- set_names(group_list, group_names)
+
+term2gene <- data.frame(
+  term = rep(names(gene_sets), sapply(gene_sets, length)),
+  gene = unlist(gene_sets)
+)
+
+# Step 2: Prepare the TERM2NAME data frame (optional, for set descriptions)
+term2name <- data.frame(
+  term = names(gene_sets),
+  name = names(gene_sets)  # You can replace this with actual descriptions if available
+)
+```
+
+```{r}
+library(colorspace)
+coords_nut <- arc_diet_labeled@reductions$umap@cell.embeddings
+coords_ob <- arc_lepip@reductions$ref.umap@cell.embeddings[arc_lepip$geno == "mut"&arc_lepip$treatment=="Sal",]
+
+ggplot() + geom_point(data=bind_cols(coords_nut,arc_diet_labeled[[]]), aes(UMAP_1,UMAP_2, color=treatment), size=0.1) +
+    scale_color_manual(values=desaturate(diet_cols, amount=0.3)) +
+    geom_point(data=coords_ob %>% data.frame()  %>% dplyr::slice_sample(prop = 0.25),color="black", aes(refUMAP_1,refUMAP_2), size=0.1, alpha=0.5) +
+    theme_void() + coord_equal() + NoLegend()
+
+ggsave("zz.pdf", h=4,w=4)
+```
+
+```{r}
+library(ggh4x)
+
+ob_deg <- purrr::map_dfr(names(pseudobulk_lepip), function(x) {
+    pb <- pseudobulk_lepip[[x]]
+    colnames(pb) <- paste0(colnames(pb), "_", pb$samples$time)
+    pb$samples$group <- interaction(pb$samples$geno, pb$samples$treatment)
+    pb$samples$time <- factor(pb$samples$time, levels=c("24","1","3","6"))
+    design <-  model.matrix(~0 + group + time + hash_pool, data=pb$samples)
+    colnames(design) <- gsub(":", "_", colnames(design))
+    fit <- voomLmFit(pb, design)
+
+    # Create a contrast matrix for both tests
+    contrasts <- makeContrasts(
+        ob_effect = groupmut.Sal - groupwt.Sal,
+        levels = design)
+
+    fit2 <- contrasts.fit(fit, contrasts)
+    fit2 <- eBayes(fit2, robust=T)
+    alldeg <- topTable(fit2, coef = "ob_effect", n = Inf)  %>% 
+        mutate(ct=x)
+
+}, .id="loop")
+
+cross_cor <- diet_deg  %>% 
+    mutate(ct= as.character(ct))  %>% 
+    dplyr::select(gene,ct, comp, logFC)  %>% 
+    pivot_wider(
+        names_from=comp,
+        values_from=logFC
+    )  %>% 
+    inner_join(ob_deg, by =c("gene", "ct"))   %>% 
+    mutate(has_lowp = P.Value<0.01) %>%
+    filter(has_lowp) %>% 
+    group_by(ct)  %>% 
+    summarise(
+        `HFD` = cor(hvc,logFC),
+        `Fast` = cor(fvc,logFC),
+        n=n()
+    )  %>% 
+    filter(n>100)  %>% 
+    dplyr::select(-n)
+
+cross_cor  %>% 
+    pivot_longer(-ct)  %>% 
+    mutate(group = ifelse(grepl("12|29|Agrp", ct), "imp", "not"))  %>% 
+    mutate(color = ifelse(grepl("12|29|Agrp", ct), ct, "other"))  %>% 
+    ggplot() +
+    aes(x=name, y=value) +
+    geom_boxplot(width=0.25, outlier.shape=NA) +
+    geom_pointpath(aes(group = ct, size=group, color=ct, alpha=group), position = position_jitter(width=0.1), mult=0.25) +
+   cowplot::theme_half_open() +
+    scale_size_manual(values=c("imp"=2, "not"=1)) +
+    scale_alpha_manual(values=c("imp"=1, "not"=0.1)) +
+    scale_color_manual(values=c("12" = "#B85182","29"= "#A0C3E7","Agrp" = "#9A84B7", "other"="grey")) +
+    scale_y_continuous(labels = scales::label_number(accuracy = 0.1)) +
+    geom_hline(yintercept=0, lty=2) +
+    #theme(panel.grid.minor = element_blank())+
+    NoLegend()  +
+    labs(x=NULL, y="Correlation with ob/ob")
+
+ggsave("zz.pdf", h=4,w=3)
+```
+
+
+```{r}
+targets::tar_load(lepip_celldist)
+
+lepip_cd_data <- lepip_celldist$results %>% 
+        rownames_to_column("row")  %>% 
+        separate(row, into=c("ct", "comp"))  %>% 
+        janitor::clean_names()  %>% 
+        arrange(dist)  %>%
+        dplyr::select(comp,ct,dist, x95_percent_ci_low, x95_percent_ci_upper, p_val)  %>% 
+        pivot_wider(
+            names_from=comp,
+            values_from=c(dist,x95_percent_ci_low, x95_percent_ci_upper, p_val)
+        )  %>% 
+    filter(ct %in% names(which(table(arc_lepip$predicted.celltype)>500)))  %>% 
+    mutate(color = ifelse(grepl("12|29|Agrp", ct), ct, "other")) 
+        
+lepip_cd_data %>% 
+    ggplot() + 
+    aes(dist_mut, dist_wt, label=ct, color=color) +
+    geom_point() + 
+    geom_errorbar(data = lepip_cd_data  %>% filter(color!="other"), aes(ymin = x95_percent_ci_low_wt, ymax = x95_percent_ci_upper_wt,  color=color), width = 0) +
+    geom_errorbarh(data = lepip_cd_data %>% filter(color!="other"), aes(xmin = x95_percent_ci_low_mut, xmax = x95_percent_ci_upper_mut,  color=color), height = 0) +
+    ggrepel::geom_text_repel() +
+    scale_color_manual(values=c("12" = "#B85182","29"= "#A0C3E7","Agrp" = "#9A84B7", "other"="grey")) +
+    geom_abline() + 
+    cowplot::theme_half_open() +
+    coord_equal() + NoLegend()
+    
+
+ggsave("zz.pdf", h=3,w=3)
+```
+
+```{r}
+targets::tar_load(obwt_celldist)
+targets::tar_load(lepip_celldist)
+targets::tar_load(hfdveh_celldist)
+targets::tar_load(fastveh_celldist)
+targets::tar_load(refeed_celldist)
+
+dist_data <- obwt_celldist$results  %>%  
+    mutate(comp = "geno")  %>% 
+    rownames_to_column("ct")  %>% 
+    bind_rows(
+        lepip_celldist$results %>% 
+        rownames_to_column("row")  %>% 
+        separate(row, into=c("ct", "comp"))
+    )  %>% 
+    bind_rows(
+        hfdveh_celldist$results  %>% 
+        mutate(comp = "hfd")  %>% 
+        rownames_to_column("ct") 
+    )  %>% 
+    bind_rows(
+        fastveh_celldist$results  %>% 
+        mutate(comp = "fast")  %>% 
+        rownames_to_column("ct") 
+    )   %>% 
+    bind_rows(
+        refeed_celldist$results  %>% 
+        mutate(comp = "rf")  %>% 
+        rownames_to_column("ct") 
+    )   %>% 
+    janitor::clean_names() 
+
+dist_data  %>% 
+    ggplot() +
+    aes(x=fct_reorder(comp,-dist), y=dist) +
+    geom_violin() +
+    geom_point(data = dist_data %>% filter(ct %in% c("Agrp", 12, 29)), aes(color=ct), position=position_dodge(width=0.5)) +
+    theme_classic() + NoLegend() +
+    labs(x=NULL)
+
+ggsave("zz.pdf", h=2, w=4)
+```
+
+```{r}
+arc_lepip <- AddModuleScore(arc_lepip, features=list(metagenes, expanded_metagenes), assay="RNA")
+
+oblep <- arc_lepip[[]]  %>%  
+    filter(dataset=="lepip" & predicted.celltype  %in% c(12,29,"Agrp"))  %>%
+    mutate(treatment = factor(treatment, c("Lep", "Sal")))  %>%
+    group_by(treatment, predicted.celltype, hash.mcl.ID, hash_pool, orig.ident, geno, time, sex)  %>% 
+    summarise(mean = mean(Cluster2)) %>% 
+    ungroup()  %>% 
+    nest(-predicted.celltype)  %>% 
+    mutate(mod = purrr::map(data, function(x) lme4::lmer(mean ~ treatment*geno*time +  (1|hash.mcl.ID) + (1|hash_pool), data= x)))
+
+oblepdat <- purrr::map_dfr(oblep$mod, ~emmeans::emmeans(.x, pairwise~treatment|geno*time)$contrasts  %>%  data.frame(), .id="clus")  %>% 
+    mutate(padj = p.adjust(p.value))  %>%   arrange(padj)  %>% 
+    mutate(ct = oblep$predicted.celltype[as.numeric(clus)]) 
+
+ggplot(oblepdat) +
+    aes(x=factor(time, levels=c("1","3","6","24")), estimate) +
+    geom_line(aes(lty=geno, group=geno)) +
+    geom_errorbar(aes(ymin = estimate-SE, ymax=estimate+SE), width=0) +
+    geom_point(shape=21, aes(fill=I(ifelse(padj<0.1,"red","grey80"))), size=2) +
+    geom_hline(yintercept=0) +
+    cowplot::theme_half_open() + labs(x=NULL) +
+    scale_y_continuous(breaks = seq(0, max(oblepdat$estimate, na.rm = TRUE), by = 0.1)) +
+    facet_wrap(~ct, ncol=1, scales="free_y") + NoLegend()
+
+#lepip_cd/lgs_overtime+plot_layout(heights=c(1,2))
+ggsave("zz.pdf",h=5,w=2.5)
+```
+
+```{r}
+pb <- pseudobulk_lepip[["12"]]
+pb <- pb[,pb$samples$time!=24]
+pb$samples$group <- interaction(pb$samples$geno, pb$samples$treatment)
+pb$samples$time <- factor(pb$samples$time, levels=c("1","3","6"))
+design <-  model.matrix(~geno*treatment + time + hash_pool, data=pb$samples)
+colnames(design) <- gsub(":", "_", colnames(design))
+fit <- voomLmFit(pb, design)
+fit <- eBayes(fit, robust=F)
+
+# Perform F-test for overall treatment effect
+treatment_cols <- grep("treatment", colnames(fit$coefficients))
+treatment_f <- topTable(fit, coef=treatment_cols, number=Inf, sort.by="F", p=0.05)
+
+pb <- pseudobulk_lepip[["12"]]
+colnames(pb) <- paste0(colnames(pb), "_", pb$samples$time)
+logcpm <- edgeR::cpm(pb, prior.count=3, log=T)
+logcpm <- limma::removeBatchEffect(logcpm, batch=pb$samples$hash_pool,
+                                design = model.matrix(~geno*treatment*time, data=pb$samples))
+logcpm <- logcpm[rownames(logcpm) %in% rownames(treatment_f),]
+
+expr_data <- t(scale(t(logcpm)))
+gene_hclust <- hclust(dist(expr_data), method="ward.D2")
+clusters_dynamic <- cutreeDynamic(gene_hclust, distM = as.matrix(dist(expr_data)), minClusterSize=50,
+                                  deepSplit = 2, pamRespectsDendro = FALSE, pamStage=F)
+
+
+cluster_df <- data.frame(clusters=paste0("cluster_",clusters_dynamic+1), gene = rownames(expr_data))  
+write.csv(cluster_df, here::here("results/glp1r_lep_clusters.csv"))
+
+plot_data <- bind_cols(data.frame(expr_data, check.names=F), cluster_df) %>% 
+    pivot_longer(c(-gene, -clusters), names_to = "sample", values_to = "expression") %>% 
+    separate(sample, into  = c("hash.mcl.ID", "geno", "treatment", "time"), sep = "_")  %>% 
+    group_by(clusters, time, treatment, geno, gene)  %>% 
+    summarise(mean = mean(expression))  %>% 
+    #pivot_wider(names_from=treatment, values_from=mean)  %>% 
+    #mutate(log2_fold_change = log2((Lep + 0.1) / (Sal + 0.1)))  %>% 
+    mutate(geno=factor(geno, levels=c("clusterwt","clustermut")), clusters = clusters+1) 
+```
+
+```{r}
+cluster_data <- enframe(rownames(pb))  %>% 
+    full_join(cluster_df, by=c("value" = "gene"))   %>% 
+    mutate(clusters = replace_na(clusters, "cluster_0"), indicator = 1) %>%  # Create an indicator column
+    pivot_wider(names_from = clusters, values_from = indicator, values_fill = 0) %>% # Convert to wide format
+    select(-name, -cluster_0) 
+ 
+
+mapping.data1 <- read.table(gzfile("/projects/perslab/data/yggdrasil/projects/mludwig/Ludwig-2021/data/gene_info/Mus_musculus.GRCm38.90.gene_name_version2ensembl.txt.gz"), header=T)
+mapping.data2 <- read.table(gzfile("/projects/perslab/data/yggdrasil/projects/mludwig/Ludwig-2021/data/gene_info/map_hsapiens_mmusculus.gz"), header = T)
+mapping.data3 <- read.csv("/projects/perslab/data/yggdrasil/projects/mludwig/DVC/data/gene_info/NCBI37.3.gene.loc", sep = "", header = F)
+colnames(mapping.data3) <- c("ENTREZID", "chr", "start", "end", "strand", "ALIAS")
+
+cluster_data$gene <- mapping.data1$ensembl_gene_id[match(cluster_data$value, mapping.data1$gene_name_optimal)]
+cluster_data$gene <- mapping.data2$ensembl_gene_id[
+  match(cluster_data$gene, mapping.data2$mmusculus_homolog_ensembl_gene)]
+cluster_data <- cluster_data[!is.na(cluster_data$gene),]
+cluster_data <- cluster_data  %>%  select("gene",starts_with("cluster"))
+
+write.table(cluster_data,
+           file = "/projects/perslab/people/lhv464/glp1r_leptin/results/LDSC_input_lepip_glp1r_genes.csv",
+            row.names = F, sep = ",")
+```
+
+```{r}
+geno_colors <- c("clusterwt" = "#F1AE75", "clustermut" = "#E96832")
+trt_colors <- c("Sal" = "#57C2AF", "Lep" = "#145B5A")
+
+deg_overtime <- plot_data %>% 
+    ggplot() +
+    aes(x=factor(time,levels=c(1,3,6,24)), y=mean, color=treatment) +
+    stat_summary(geom="point") +
+    stat_summary(geom="line", aes(group=treatment)) +
+    stat_summary(geom="errorbar", aes(group=interaction(treatment,time)), width=0) +
+    facet_grid2(cols=vars(geno), rows=vars(clusters)) +
+    scale_y_continuous(breaks = c(-1,0,1)) +
+    cowplot::theme_half_open() +
+    cowplot::background_grid( size.major = 0.25, size.minor = 0.1) +
+    scale_color_manual(values = trt_colors) +
+    #theme(panel.grid.minor=element_blank())+
+    geom_hline(yintercept=0, lty=2) +
+    theme(legend.position="none") +
+    labs(x=NULL, y="Scaled Expression")
+
+cor_data <- bind_cols(data.frame(logcpm, check.names=F), cluster_df) %>% 
+    pivot_longer(c(-gene, -clusters), names_to = "sample", values_to = "expression") %>% 
+    separate(sample, into  = c("hash.mcl.ID", "geno", "treatment", "time"), sep = "_")
+
+cor_data %>% 
+    group_by(clusters, time, treatment, geno)  %>% 
+    mutate(mean = mean(expression))  %>% 
+    group_by(clusters, gene)  %>% 
+    mutate(cor = cor(expression, mean))  %>%  distinct(gene, .keep_all=T)  %>% 
+    arrange(clusters, -cor)  %>%
+    dplyr::select(gene, treatment, time,geno, cor)  %>% 
+    group_by(clusters)  %>% 
+    dplyr::top_n(20) %>% 
+    print(n=Inf) 
+
+gene_plots <- cor_data %>% 
+    group_by(clusters, time, treatment, geno)  %>% 
+    mutate(mean = mean(expression))  %>% 
+    group_by(clusters, gene)  %>% 
+    mutate(cor = cor(expression, mean))  %>%  distinct(gene, .keep_all=T)  %>% 
+    arrange(clusters, -cor)  %>%
+    dplyr::select(gene, treatment, time,geno, cor)  %>% 
+    group_by(clusters)  %>% 
+    dplyr::top_n(5)  %>% 
+    ggplot() +
+    aes(x=cor, y=gene, fill=factor(clusters)) +
+    geom_col(fill="#B7467E", color="black") +
+    facet_wrap(~clusters, ncol=1, scales="free_y") +
+    cowplot::theme_minimal_vgrid() +
+    scale_x_continuous(labels = scales::label_number(accuracy = 0.1)) +
+    theme(legend.position="none", strip.text=element_blank(), axis.text.x=element_text(angle=90, hjust=1, vjust=0.5),panel.grid.major=element_blank()) +
+    labs(y=NULL, x=NULL)
+
+diet_go <- compareCluster(gene~clusters, data= cluster_df, fun="enricher", TERM2GENE = term2gene %>% filter(grepl("^12",term)),
+      TERM2NAME = term2name, pAdjustMethod = "BH", pvalueCutoff = 1,qvalueCutoff = 1, maxGSSize=1500,
+       universe = rownames(pb))
+
+enrich_plot <- diet_go@compareClusterResult %>% arrange(ID)  %>% 
+    mutate(dir = ifelse(grepl("-1", ID), "-", "+"), 
+    comp = case_when(grepl("fvc",ID) ~ "Fast",
+                     grepl("hvc", ID) ~ "HFD",
+                     grepl("rvf", ID) ~ "Ref"),
+    size = ifelse(qvalue<0.05, -log10(qvalue), 0.1))  %>% 
+    complete(dir, Cluster, comp, fill = list(size = 0.1)) %>%
+    ggplot() +
+    aes(x=dir, y=1, size=size) +
+    geom_point() + facet_grid2(vars(Cluster), vars(comp)) +
+    cowplot::theme_half_open() +
+    theme(
+        panel.grid.major=element_blank(),
+        axis.text.x=element_text(angle=90, hjust=1, vjust=0.5),
+        axis.ticks.y = element_blank(),
+        legend.position="none",
+        axis.text.y = element_blank(),
+        strip.background = element_blank(),
+        strip.text.y = element_blank(),
+        strip.text.x = element_blank()
+) + labs(y=NULL, x=NULL) 
+
+
+stitch <- deg_overtime+gene_plots+enrich_plot + plot_layout(widths=c(0.75,0.3,0.5))
+ggsave("glp1r_leptin_clustering.pdf", stitch, h=5, w=6)
+```
+
+```{r}
+glp1r_go_terms <- compareCluster(gene~clusters, data= cluster_df, fun="enrichGO", OrgDb = org.Mm.eg.db, ont="ALL",
+        keyType="SYMBOL",
+        minGSSize = 10, maxGSSize = 500, qvalue=5e-2,
+        universe = rownames(pb))
+
+glp1r_go_terms@compareClusterResult  %>%  filter(Cluster==2)  %>%  head(10)
+```
+
+```{r}
+pb <- pseudobulk_lepip[["Agrp"]]
+pb <- pb[,pb$samples$time!=24]
+pb$samples$group <- interaction(pb$samples$geno, pb$samples$treatment)
+pb$samples$time <- factor(pb$samples$time, levels=c("1","3","6"))
+design <-  model.matrix(~geno*treatment + time + hash_pool, data=pb$samples)
+colnames(design) <- gsub(":", "_", colnames(design))
+fit <- voomLmFit(pb, design)
+fit <- eBayes(fit, robust=F)
+
+# Perform F-test for overall treatment effect
+treatment_cols <- grep("treatment", colnames(fit$coefficients))
+treatment_f <- topTable(fit, coef=treatment_cols, number=Inf, sort.by="F", p=0.05)
+
+pb <- pseudobulk_lepip[["Agrp"]]
+colnames(pb) <- paste0(colnames(pb), "_", pb$samples$time)
+logcpm <- edgeR::cpm(pb, prior.count=3, log=T)
+logcpm <- limma::removeBatchEffect(logcpm, batch=pb$samples$hash_pool,
+                                design = model.matrix(~geno*treatment*time, data=pb$samples))
+logcpm <- logcpm[rownames(logcpm) %in% rownames(treatment_f),]
+
+expr_data <- t(scale(t(logcpm)))
+gene_hclust <- hclust(dist(expr_data), method="ward.D2")
+clusters_dynamic <- cutreeDynamic(gene_hclust, distM = as.matrix(dist(expr_data)), minClusterSize=50,
+                                  deepSplit = 1, pamRespectsDendro = FALSE, pamStage=F)
+table(clusters_dynamic)
+cluster_df <- data.frame(clusters=clusters_dynamic, gene = rownames(expr_data))  
+write.csv(cluster_df, here::here("results/agrp_lep_clusters.csv"))
+
+plot_data <- bind_cols(data.frame(expr_data, check.names=F), cluster_df) %>% 
+    pivot_longer(c(-gene, -clusters), names_to = "sample", values_to = "expression") %>% 
+    separate(sample, into  = c("hash.mcl.ID", "geno", "treatment", "time"), sep = "_") %>% 
+    group_by(clusters, time, treatment, geno, gene)  %>% 
+    summarise(mean = mean(expression))  %>% 
+    #pivot_wider(names_from=treatment, values_from=mean)  %>% 
+    #mutate(log2_fold_change = log2((Lep + 0.1) / (Sal + 0.1)))  %>% 
+    mutate(geno=factor(geno, levels=c("clusterwt","clustermut")))  
+
+geno_colors <- c("clusterwt" = "#F1AE75", "clustermut" = "#E96832")
+trt_colors <- c("Sal" = "#57C2AF", "Lep" = "#145B5A")
+
+deg_overtime <- plot_data %>% 
+    ggplot() +
+    aes(x=factor(time,levels=c(1,3,6,24)), y=mean, color=treatment) +
+    stat_summary(geom="point") +
+    stat_summary(geom="line", aes(group=treatment)) +
+    stat_summary(geom="errorbar", aes(group=interaction(treatment,time)), width=0) +
+    facet_grid2(cols=vars(geno), rows=vars(clusters)) +
+    scale_y_continuous(breaks = c(-1,0,1)) +
+    cowplot::theme_half_open() +
+    cowplot::background_grid( size.major = 0.25, size.minor = 0.1) +
+    scale_color_manual(values = trt_colors) +
+    #theme(panel.grid.minor=element_blank())+
+    geom_hline(yintercept=0, lty=2) +
+    theme(legend.position="none") +
+    labs(x=NULL, y="Scaled Expression")
+
+cor_data <- bind_cols(data.frame(logcpm, check.names=F), cluster_df) %>% 
+    pivot_longer(c(-gene, -clusters), names_to = "sample", values_to = "expression") %>% 
+    separate(sample, into  = c("hash.mcl.ID", "geno", "treatment", "time"), sep = "_")
+
+cor_data %>% 
+    group_by(clusters, time, treatment, geno)  %>% 
+    mutate(mean = mean(expression))  %>% 
+    group_by(clusters, gene)  %>% 
+    mutate(cor = cor(expression, mean))  %>%  distinct(gene, .keep_all=T)  %>% 
+    arrange(clusters, -cor)  %>%
+    dplyr::select(gene, treatment, time,geno, cor)  %>% 
+    group_by(clusters)  %>% 
+    dplyr::top_n(20) %>% 
+    print(n=Inf) 
+
+gene_plots <- cor_data %>% 
+    group_by(clusters, time, treatment, geno)  %>% 
+    mutate(mean = mean(expression))  %>% 
+    group_by(clusters, gene)  %>% 
+    mutate(cor = cor(expression, mean))  %>%  distinct(gene, .keep_all=T)  %>% 
+    arrange(clusters, -cor)  %>%
+    dplyr::select(gene, treatment, time,geno, cor)  %>% 
+    group_by(clusters)  %>% 
+    dplyr::top_n(5)  %>% 
+    ggplot() +
+    aes(x=cor, y=gene) +
+    geom_col(fill="#9780B5", color="black", alpha=0.6) +
+    facet_wrap(~clusters, ncol=1, scales="free_y") +
+    cowplot::theme_minimal_vgrid() +
+    scale_x_continuous(labels = scales::label_number(accuracy = 0.1)) +
+    theme(legend.position="none", strip.text=element_blank(), axis.text.x=element_text(angle=90, hjust=1, vjust=0.5),panel.grid.major=element_blank()) +
+    labs(y=NULL, x=NULL)
+
+diet_go <- compareCluster(gene~clusters, data= cluster_df, fun="enricher", TERM2GENE = term2gene %>% filter(grepl("^Agrp",term)),
+      TERM2NAME = term2name, pAdjustMethod = "BH", pvalueCutoff = 1,qvalueCutoff = 1, maxGSSize=1500,
+       universe = rownames(pb))
+
+enrich_plot <- diet_go@compareClusterResult %>% arrange(ID)  %>% 
+    mutate(dir = ifelse(grepl("-1", ID), "-", "+"), 
+    comp = case_when(grepl("fvc",ID) ~ "Fast",
+                     grepl("hvc", ID) ~ "HFD",
+                     grepl("rvf", ID) ~ "Ref"),
+    size = ifelse(qvalue<0.05, -log10(qvalue), 0.1))  %>% 
+    complete(dir, Cluster, comp, fill = list(size = 0.1)) %>%
+    ggplot() +
+    aes(x=dir, y=1, size=size) +
+    geom_point() + facet_grid2(vars(Cluster), vars(comp)) +
+    cowplot::theme_half_open() +
+    theme(
+        panel.grid.major=element_blank(),
+        axis.text.x=element_text(angle=90, hjust=1, vjust=0.5),
+        axis.ticks.y = element_blank(),
+        legend.position="none",
+        axis.text.y = element_blank(),
+        strip.background = element_blank(),
+        strip.text.y = element_blank(),
+        strip.text.x = element_blank()
+) + labs(y=NULL, x=NULL) 
+
+
+stitch <- deg_overtime+gene_plots+enrich_plot + plot_layout(widths=c(0.75,0.3,0.5))
+ggsave("agrp_leptin_clustering.pdf", stitch, h=5, w=6)
+```
+
+```{r}
+agrp_go_terms <- compareCluster(gene~clusters, data= cluster_df, fun="enrichGO", OrgDb = org.Mm.eg.db, ont="ALL",
+        keyType="SYMBOL",
+        minGSSize = 10, maxGSSize = 500, qvalue=5e-2,
+        universe = rownames(pb))
+
+agrp_go_terms@compareClusterResult  %>%  filter(Cluster==2)  %>%  head(10)
+```
+
+```{r}
+humlep <- purrr::map_dfr(split(cluster_df$gene, f=cluster_df$clusters), function(x) {
+            if(length(x)>10) {
+                genes_converted <- data.frame(convert_mouse_to_human(x)) %>% filter(!duplicated(X1))
+                genes_entrez <- AnnotationDbi::select(org.Hs.eg.db,
+                            keys = genes_converted$X2,
+                            columns = c("ENTREZID", "SYMBOL"),
+                            keytype = "SYMBOL")  %>% 
+                            filter(!duplicated(SYMBOL))
+                return(genes_entrez)
+            } else {
+                NULL
+            }
+        },.id = "comp")
+
+
+write.table(humlep, file="../magma_genesets/agrp_lep_deg.txt", sep = "\t", quote=F, row.names=F)
+# List of gene.raw files to process
+gene_files <- c(
+  #"/projects/perslab/apps/MAGMA/out/Locke-UKBB2018/Locke-UKBB2018_UPDATED.genes.raw",
+  #"/projects/perslab/apps/MAGMA/out/glucose_GCST90019508/glucose_GCST90019508.genes.raw",
+  #"/projects/perslab/apps/MAGMA/out/glucose_GCST90271557/glucose_GCST90271557.genes.raw",
+  #"/projects/perslab/apps/MAGMA/out/HbA1c_GCST007954/HbA1c_GCST007954.genes.raw",
+  #"/projects/perslab/apps/MAGMA/out/NAFL_UKBB/NAFL_UKBB.genes.raw",
+  "/projects/perslab/apps/MAGMA/out/Weight_GWASatlas3440/Weight_GWASatlas3440.genes.raw",
+  "/projects/perslab/apps/MAGMA/out/ArmFatFreeMass_GWASatlas3462/ArmFatFreeMass_GWASatlas3462.genes.raw",
+  "/projects/perslab/apps/MAGMA/out/ArmFatPercentage_GWASatlas3460/ArmFatPercentage_GWASatlas3460.genes.raw",
+  "/projects/perslab/apps/MAGMA/out/ArmFatMass_GWASatlas3461/ArmFatMass_GWASatlas3461.genes.raw",
+  "/projects/perslab/apps/MAGMA/out/ArmImpedance_GWASatlas3450/ArmImpedance_GWASatlas3450.genes.raw",
+  #"/projects/perslab/people/nvg559/glucose/magma_gsa/dat/Qiao_metaGLU.genes.raw",
+  "/projects/perslab/people/nvg559/glucose/magma_gsa/dat/Qiao_RG.genes.raw"
+  # Add more files as needed
+)
+
+# Common parameters
+set_annot_file <- "/projects/perslab/people/lhv464/magma_genesets/agrp_lep_deg.txt"
+set_col <- "comp"
+gene_col <- "ENTREZID"
+covar_file <- "/projects/perslab/people/lhv464/glp1r_leptin/tissue_gex.cov.txt"
+# Loop through each gene file
+for (gene_file in gene_files) {
+  if(!grepl("bmi", gene_file)) {
+  # Extract a base name for the output file
+  base_name <- basename(gene_file)
+  output_name <- paste0("agrp_",sub("\\.genes\\.raw$", "_enrichment", base_name))
+  
+  # Construct the command
+  args <- c(
+    "--gene-results", gene_file,
+    "--set-annot", set_annot_file,
+    paste0("set-col=", set_col),
+    paste0("gene-col=", gene_col),
+    "--out", paste0("gene_sets/lep_deg/",output_name)
+  )
+  
+  # Execute MAGMA command
+  result <- system2("magma", args = args)
+  
+  # Check the result
+  if (result == 0) {
+    cat("Successfully processed:", gene_file, "\n")
+  } else {
+    cat("Error processing:", gene_file, "\n")
+  }
+ } else {
+    # Extract a base name for the output file
+  base_name <- basename(gene_file)
+  output_name <- paste0("agrp_",sub("\\.genes\\.raw$", "_enrichment", base_name))
+  
+  # Construct the command
+  args <- c(
+    "--gene-results", gene_file,
+    "--set-annot", set_annot_file,
+    paste0("set-col=", set_col),
+    paste0("gene-col=", "SYMBOL"),
+    "--out", paste0("gene_sets/lep_deg/",output_name)
+  )
+  
+  # Execute MAGMA command
+  result <- system2("magma", args = args)
+  
+  # Check the result
+  if (result == 0) {
+    cat("Successfully processed:", gene_file, "\n")
+  } else {
+    cat("Error processing:", gene_file, "\n")
+  }
+ }
+}
+```
+
+```{r}
+library(enrichplot)
+
+formula_res <- compareCluster(gene~clusters, data= cluster_df, fun="enrichGO", OrgDb = org.Mm.eg.db, ont="ALL",
+        keyType="SYMBOL",
+        minGSSize = 10, maxGSSize = 500, qvalue=5e-2,
+        universe = rownames(pb))
+
+formula_res_simple <- simplify(formula_res, cutoff=0.1, by="p.adjust", select_fun=min)
+edo <- pairwise_termsim(formula_res_simple)
+p1 <- emapplot(edo, pie.params = list(pie = "count"), node_label="category", layout="kk")
+p1 
+dev.off()
+
+test <- fortify(formula_res_simple, showCategory = 4)
+idx <- order(test[["GeneRatio"]], decreasing = T)
+test$Description <- factor(test$Description, levels=rev(unique(test$Description[idx])))
+
+goenrich <- test  %>% 
+    mutate(order = as.numeric(Cluster))  %>% 
+    complete(Description, Cluster) %>%
+    ggplot() +
+    aes(x=Cluster, y = fct_reorder(str_wrap(Description,width=35), -order), fill = -log10(qvalue)) +
+    geom_tile(color="white", size=0.25) +
+    theme(panel.grid.major=element_blank(), panel.background = element_blank(), text = element_text(size=6, face="bold")) +
+    labs(x=NULL, y=NULL) +
+    scale_fill_steps(low = "white", high = "brown",  na.value = "grey") +
+    scale_y_discrete(position = "right")
+
+deg_overtime + goenrich
+
+ggsave("a.pdf", h=6, w=10)
+
+```
+```{r}
+diet_go <- compareCluster(gene~clusters, data= cluster_df, fun="enricher", TERM2GENE = term2gene,
+      TERM2NAME = term2name, pAdjustMethod = "BH", pvalueCutoff = 1,qvalueCutoff = 1, maxGSSize=1500,
+       universe = rownames(pb))
+
+diet_go@compareClusterResult %>% arrange(qvalue)  %>% filter(!grepl("lep|1[.]",ID))
+
+
+
+formula_res@compareClusterResult %>% filter(Cluster==3)  %>% arrange(qvalue)  %>% head
+
+df %>% 
+    group_by(clusters, time, treatment, geno)  %>% 
+    mutate(mean = mean(expression))  %>% 
+    group_by(clusters, gene)  %>% 
+    mutate(cor = cor(expression, mean))  %>%  distinct(gene, .keep_all=T)  %>% 
+    arrange(clusters, -cor)  %>% 
+    dplyr::select(gene, treatment, time,geno, cor)  %>% 
+    group_by(clusters)  %>% 
+    dplyr::top_n(10)  %>% 
+    print(n=50)
+```
+
+```{r}
+DefaultAssay(arc_lepip) <- "RNA"
+arc_lepip_sub <- subset(arc_lepip, subset = predicted.celltype %in% lepclus, features=metagenes)
+obj <- process_seurat(arc_lepip_sub, method = "log", cluster=F)
+obj[["group"]] <- interaction(obj$predicted.celltype, obj$geno, obj$time)
+table
+mat <- GetAssayData(obj, slot="scale.data", assay="RNA") %>%  as.matrix()
+scd_res <- scDist(mat, meta.data=obj@meta.data, min.counts.per.cell = 5, fixed.effects = "treatment",
+         clusters = "group", d = 5)
+
+scd_res$results
+```
+
+```{r}
+pairwise_lepdeg <- purrr::map_dfr(names(pseudobulk_lepip), function(x) {
+    pb <- pseudobulk_lepip[[x]]
+    colnames(pb) <- paste0(colnames(pb), "_", pb$samples$time)
+    pb$samples$group <- interaction(pb$samples$geno, pb$samples$treatment)
+    pb$samples$time <- factor(pb$samples$time, levels=c("24","1","3","6"))
+    design <-  model.matrix(~0 + group + time + hash_pool, data=pb$samples)
+    colnames(design) <- gsub(":", "_", colnames(design))
+    fit <- voomLmFit(pb, design)
+
+    # Create a contrast matrix for both tests
+    contrasts <- makeContrasts(
+        mut_lep = groupmut.Lep - groupmut.Sal,
+        wt_lep = groupwt.Lep - groupwt.Sal,
+        lep_diff = (groupmut.Lep - groupmut.Sal) - (groupwt.Lep - groupwt.Sal),
+        lep_all = (groupmut.Lep + groupwt.Lep)/2 - (groupmut.Sal + groupwt.Sal)/2,
+        levels = design)
+    fit2 <- contrasts.fit(fit, contrasts)
+    fit2 <- eBayes(fit2, robust=F)
+
+    alldeg <- topTable(fit2, coef = "mut_lep", n = Inf) %>% mutate(comp = "mut_lep") %>%
+                bind_rows(topTable(fit2, coef = "wt_lep", n = Inf) %>% mutate(comp = "wt_lep")) %>%
+                bind_rows(topTable(fit2, coef = "lep_diff", n = Inf) %>% mutate(comp = "lep_diff"))  %>% 
+                bind_rows(topTable(fit2, coef = "lep_all", n = Inf) %>% mutate(comp = "lep_all"))  %>% 
+                mutate(ct=x)
+
+}, .id="loop")
+
+pairwise_lepdeg  %>% 
+    group_by(gene)  %>% 
+    mutate(n=sum(adj.P.Val<0.2), log = sum(abs(logFC)>0.5))  %>% ungroup()  %>% 
+    filter(comp=="lep_all", ct %in% lepclus)  %>% 
+    filter(n>0, log>0)  %>% 
+    dplyr::select(logFC, gene, ct)  %>% 
+    pivot_wider(names_from=ct, values_from=logFC)  %>%
+    corrr::correlate()  %>% 
+    column_to_rownames("term")  %>% 
+    pheatmap(.)
+dev.off()
+gse_all <- purrr::map(colnames(contrasts), function(x) {
+  degs <- topTable(fit2, coef=x, n=Inf, p=0.1)
+  print(dim(degs))
+  if(length(degs$gene)>1){
+    degs$group <- interaction(x,sign(degs$logFC))
+    gores <- compareCluster(gene~group, data= degs, fun="enricher",TERM2GENE = term2gene,
+      TERM2NAME = term2name, pAdjustMethod = "BH", pvalueCutoff = 1,qvalueCutoff = 1, maxGSSize=1500,
+       universe = rownames(pb))
+    return(gores)
+   } else {
+    return(0) 
+   }
+  })
+
+
+filtdeg_lep <- pairwise_lepdeg  %>%  filter(adj.P.Val<0.05)  %>% 
+        mutate(group = interaction(ct, comp))
+
+
+```
+
+```{r}
+names(clusters)[clusters==2] %>% sort(.)
+```
+
+```{r}
+arc_lepip <- AddModuleScore(arc_lepip, features=list(metagenes), assay="RNA")
+
+mod_data <-  arc_lepip[[]] %>% filter(time!=24)  %>% 
+    group_by(treatment, predicted.celltype, hash.mcl.ID, geno, orig.ident, time)  %>% summarise(mean = mean(Cluster1))
+
+obdiff <- lm(mean~treatment*predicted.celltype*geno+time, data=mod_data) %>% 
+    emmeans::emmeans(., pairwise~treatment|predicted.celltype*geno)  %$% contrasts %>%  
+    data.frame()  %>% mutate(padj = p.adjust(p.value))  %>% arrange(p.value)
+
+dat <- obdiff  %>% dplyr::rename("seurat_clusters" = "predicted.celltype")  %>% 
+    inner_join(outdio%>% mutate(pert = "hfd"), by="seurat_clusters") %>% 
+    select(geno, estimate.x, estimate.y, seurat_clusters)  %>% 
+    mutate(lepr = ifelse(seurat_clusters %in% c("Agrp","12","26","29","28"), "lepr", "low")) 
+
+lm(estimate.x~estimate.y, data=dat  %>% filter(lepr == "lepr" & geno == "mut"))  %>%  summary()
+
+dat  %>% 
+    filter(lepr == "lepr")  %>%  
+    ggplot() +
+    aes(x=estimate.x, y=estimate.y) +
+    geom_point() + 
+    geom_smooth(method="lm", fill="red", alpha=0.05) +
+    facet_wrap(~geno, ncol=1) +
+    theme_classic() 
+
+ggsave(paste0(fig_path_3,"lepsig_overtime.pdf"),h=2,w=1.5)
+dev.off()
+```
+
+```{r}
+mouse_human_genes <- read.csv("http://www.informatics.jax.org/downloads/reports/HOM_MouseHumanSequence.rpt",sep="\t")
+# separate human and mouse 
+mouse <- split.data.frame(mouse_human_genes,mouse_human_genes$Common.Organism.Name)[[2]]
+human <- split.data.frame(mouse_human_genes,mouse_human_genes$Common.Organism.Name)[[1]]
+
+# remove some columns
+mouse <- mouse[,c(1,4)]
+human <- human[,c(1,4)]
+
+# merge the 2 dataset  (note that the human list is longer than the mouse one)
+mh_data <- merge.data.frame(mouse,human,by = "DB.Class.Key",all.y = TRUE) 
+head(mh_data)
+
+genes <- read.csv("/maps/projects/perslab/people/lhv464/glp1r_leptin/analysis/Perslab_genes_240603.csv")
+ens <- genes  %>% filter(grepl("L|N|T", CombinedSource))
+rv_mouse <- merge(mh_data, ens, by.x="Symbol.y", by.y="Gene.symbol")  %>% pull(Symbol.x)  %>% unique()
+```
+
+
+```{r}
+pb <- pseudobulk_lepip[["0"]]
+pb$samples$geno <- factor(pb$samples$geno, levels=c("wt","mut"))
+pb$samples$treatment <- factor(pb$samples$treatment, levels=c("Sal","Lep"))
+pb$samples$time <- factor(pb$samples$time, levels=c("24","1","3","6"))
+design <-  model.matrix(~geno + time + geno:treatment+hash_pool, data=pb$samples)
+colnames(design) <- gsub(":", "_", colnames(design))
+
+fit <- voomLmFit(pb, design)
+fit <- eBayes(fit, robust=F)
+
+obwt <- topTable(fit, coef=2, n=Inf, p=0.1)  %>% filter(abs(logFC)>0.75)  %>%  pull(gene) 
+obwt
+perform_fisher_test(obwt, rv_mouse)
+perform_hypergeometric_test(obwt, rv_mouse)
+
+coef <- grep("wt_tr", colnames(design))
+wtlep <- topTable(fit, coef=coef, n=Inf)
+perform_fisher_test(wtlep, rv_mouse)
+perform_hypergeometric_test(wtlep, rv_mouse)
+
+
+coef <- grep("mut_tr", colnames(design))
+obwt <- topTable(fit, coef=coef, n=Inf)
+perform_fisher_test(obwt, rv_mouse)
+perform_hypergeometric_test(obwt, rv_mouse)
+colnames(design)
+fit2 <- contrasts.fit(fit, c(rep(0,10),1,1))
+fit2 <- eBayes(fit2, robust=F)
+obwt <- topTable(fit2, coef=1, n=Inf, p=0.1)  
+
+perform_fisher_test(obwt, rv_mouse)
+perform_hypergeometric_test(obwt, rv_mouse)
+```
+
+```{r}
+pb$counts[c("Gabrb1","Gabra5"),]
+```
+
+```{r}
+pb <- pseudobulk_lepip[["9"]]
+pb <- pb[,which(!pb$samples$treatment == "Lep")]
+pb$samples$geno <- factor(pb$samples$geno, levels=c("wt","mut"))
+#pb$samples$treatment <- factor(pb$samples$treatment, levels=c("Sal","Lep"))
+design <-  model.matrix(~geno+time+hash_pool, data=pb$samples)
+colnames(design)
+fit <- voomLmFit(pb, design)
+fit <- eBayes(fit, robust=T)
+topTable(fit, coef=2, n=Inf, p=0.05)  %>% arrange(adj.P.Val)  %>%  filter(gene == "Scn9a")
+
+topTable(fit, coef=4, n=Inf, p=0.05) %>% arrange(adj.P.Val)  %>%  head()
+```
+
+```{r}
+pb <- pseudobulk_lepip[["9"]]
+pb <- pb[,which(!pb$samples$time == "24")]
+pb$samples$geno <- factor(pb$samples$geno, levels=c("wt","mut"))
+pb$samples$treatment <- factor(pb$samples$treatment, levels=c("Sal","Lep"))
+design <-  model.matrix(~geno+geno:treatment, data=pb$samples)
+colnames(design)
+fit <- voomLmFit(pb, design)
+fit <- eBayes(fit, robust=T)
+fit2 <- contrasts.fit(fit, c(0,0,-1,1))
+fit2 <- eBayes(fit2, robust=T)
+topTable(fit2, n=Inf, p=0.05)  %>% arrange(adj.P.Val)  %>%  head(n=20)
+topTable(fit, coef=3, n=Inf, p=0.05)  %>% arrange(adj.P.Val)  %>%  head()
+topTable(fit, coef=4, n=Inf, p=0.05) %>% arrange(adj.P.Val)  %>%  head()
+
+cont.matrix <- makeContrasts(
+    "mut1_a"=(mut1B-mut1A)-(wtA-wtB),
+    "mut1_b"=(mut1B-mut1A)-(wtB-wtA),
+    "mut1_c"=(mut1B-wtA),
+    levels=design)
+
+dds <- dds[,dds$time!=24]
+
+dds <- DESeq(dds) 
+resultsNames(dds)
+
+results(dds, contrast=c("geno","mut","wt")) %>% data.frame() %>% filter(padj<0.05)  %>% arrange(padj)  %>%  dim
+
+# the condition effect for genotype I (the main effect)
+results(dds, contrast=c("treatment","Lep","Sal")) %>% data.frame() %>% filter(padj<0.05)  %>% arrange(padj)  %>%  dim
+
+# the condition effect for genotype II
+# this is, by definition, the main effect *plus* the interaction term
+# (the extra condition effect in genotype II compared to genotype I).
+results(dds, list( c("treatment_Lep_vs_Sal","genomut.treatmentLep") )) %>% data.frame() %>% filter(padj<0.05) %>%  
+    arrange(padj)  %>% dim
+
+# the interaction term, answering: is the condition effect *different* across genotypes?
+results(dds, name="genomut.treatmentLep")  %>% data.frame() %>% filter(padj<0.05) %>%  arrange(padj)  %>% head(20)
+```
+
+```{r}
+plotCounts(dds, "Stat3", intgroup=c("geno","treatment"), returnData=T)  %>% 
+    ggplot() +
+    aes(geno, fill=treatment, y=count) +
+    geom_boxplot() +
+    scale_y_log10()
+ggsave("a.pdf")   
+```
+
+```{r}
+targets::tar_load(lepip_celldist_nogeno)
+targets::tar_load(obwt_celldist)
+dat_ob <- obwt_celldist %>% janitor::clean_names() %>% rownames_to_column("clus")
+dat <- lepip_celldist_nogeno %>% janitor::clean_names() %>% rownames_to_column("clus") 
+# Merging on clus
+merged_df <- merge(dat, dat_ob, by="clus", suffixes = c("_mut", "_wt"))
+
+# Plotting
+p <- ggplot(merged_df, aes(x=dist_wt, y=dist_mut)) +
+  geom_errorbar(aes(ymin=x95_percent_ci_low_mut, ymax=x95_percent_ci_upper_mut), width=0, alpha=0.25) +
+  geom_errorbarh(aes(xmin=x95_percent_ci_low_wt, xmax=x95_percent_ci_upper_wt), height=0, alpha=0.25) +
+  geom_point(size=2) +
+  geom_abline(lty=2) +
+  ggrepel::geom_text_repel(aes(label = clus), max.overlaps=10) +
+  labs(x="Leptin Deficiency", y="Leptin Treatment") +
+  coord_equal() +
+  theme_classic()
+p
+
+ggsave(paste0(fig_path_2, "test_lepip_celldist.pdf"), h=3, w=3, plot = p)
+```
+
+```{r}
+deg_number <- purrr::map_dfr(res_geno_lepip, function(x) {
+    data.frame(down = -sum(x$FDR < 5e-2&x$logFC < -1), up = sum(x$FDR < 5e-2&x$logFC > 1), comp="geno")
+    }, .id="clus")  %>% 
+    bind_rows(
+        purrr::map_dfr(res_treatment_lepip, function(x) { 
+            data.frame(down = -sum(x$FDR < 5e-2&x$logFC < -1), up = sum(x$FDR < 5e-2&x$logFC > 1), comp="treatment")
+        }, .id="clus")  
+    ) 
+```
+
+```{r}
+all_deg <- 
+    purrr::map_dfr(res_treatment_lepip, function(x) {
+        x  %>% 
+            filter(FDR<5e-2 & logCPM > 3)  %>% 
+            arrange(FDR)  
+        }, .id="ct")   %>% 
+        filter(ct %in% c("0","9","26"))
+
+venn_deg <- all_deg   %>% filter(ct %in% c("0","9","26"))  %>% group_split(ct)  %>% purrr::map("gene")
+names(venn_deg) <- c("Agrp","Pomc","Glp1r")
+venngg <- ggVennDiagram(venn_deg, category.names = names(venn_deg)) + scale_fill_distiller(palette = "RdBu") + theme(legend.position="none")
+ggsave(paste0(fig_path_2, "venn_deg_test.pdf"), plot = venngg, w=8)
+```
+
+```{r}
+library(ggupset)
+p <- all_deg %>%
+  mutate(ct = case_when(ct=="0" ~ "Agrp",
+                         ct=="9" ~ "GTB",
+                         ct=="26" ~ "Pomc")) %>% 
+  group_by(gene) %>%
+  summarize(cts = list(ct))  %>% 
+  ggplot(aes(x = cts)) +
+  geom_bar() +
+  theme_bw() +
+  scale_x_upset() +
+  labs(x="Cell Types", y="# DEGs")
+ggsave("a.pdf", plot=p, h=4,w=6)
+```
+
+```{r}
+library(ggupset)
+all_deg  %>% 
+    group_by(gene)  %>%
+    mutate(n=n())  %>% 
+    filter(n==3)  %>% 
+    arrange(gene)  %>% print(n=50)
+```
+
+```{r}
+glp_uniq <- all_deg  %>% 
+    group_by(gene)  %>%
+    mutate(n=n())  %>% 
+    filter(n==1, ct == "9")  
+     
+agrp_uniq <- all_deg  %>% 
+    group_by(gene)  %>%
+    mutate(n=n())  %>% 
+    filter(n==1, ct == "0") 
+
+pomc_uniq <- all_deg  %>% 
+    group_by(gene)  %>%
+    mutate(n=n())  %>% 
+    filter(n==1, ct == "26") 
+```
+
+```{r}
+overlap_mat <- purrr::map2(list(agrp_uniq,pomc_uniq,glp_uniq), lepip_vsd[c("0","26","9")], function(x,y) {
+    mat <- t(scale(t(assay(y)[x$gene,])))
+}) 
+
+
+names(overlap_mat) <- c("0","26","9")
+```
+
+```{r}
+ct <- "9"
+cormat <- dist(overlap_mat[[ct]], method="euclidean")
+gene_hclust <- hclust(cormat, method="ward.D2")
+dend <-  as.dendrogram(gene_hclust) 
+
+
+pdf("a.pdf")
+plot(dend)
+k = 4
+n = nrow(overlap_mat[[ct]])
+MidPoint = (gene_hclust$height[n-k] + gene_hclust$height[n-k+1]) / 2
+abline(h = MidPoint, lty=2)
+dev.off()
+```
+
+```{r}
+clusters <- cutree(gene_hclust, k = 2)
+table(clusters)
+
+df <- bind_cols(data.frame(overlap_mat[[ct]], check.names=F), enframe(clusters)) %>% 
+      pivot_longer(c(-name, -value), names_to = "sample", values_to = "expression") %>% 
+      separate(sample, into  = c("hash.mcl.ID", "geno", "treatment", "time"), sep = "_")
+   
+deg_groups <- df %>% 
+    group_by(value, time, treatment, geno)  %>% 
+    mutate(mean = mean(expression))  %>% 
+    group_by(value, name)  %>% 
+    mutate(cor = cor(expression, mean))  %>%  distinct(name, .keep_all=T)  %>% 
+    arrange(value, -cor)  %>% 
+    dplyr::select(name, value, cor)
+
+# Calculate mean expression for each group
+mean_expression <- df %>%
+  group_by(name, geno, treatment, time, value) %>%
+  summarize(mean_expression = mean(expression, na.rm = TRUE))
+
+# Calculate the difference in mean expression values
+pivot_mean_expression <- mean_expression %>%
+  pivot_wider(names_from = treatment, values_from = mean_expression) %>%
+  mutate(diff_expression = Lep - Sal)
+
+pivot_mean_expression %>% 
+    group_by(value, time, geno)  %>% 
+    mutate(mean = mean(diff_expression))  %>% 
+    group_by(value, name)  %>% 
+    mutate(cor = cor(diff_expression, mean))  %>%  distinct(name, .keep_all=T)  %>% 
+    arrange(value, -cor)  %>% 
+    dplyr::select(name, value, cor)  %>% 
+    filter(value==1)  
+
+glp1r_time <- pivot_mean_expression %>% filter(name == "Itpr1")  %>% 
+    ggplot() +
+    aes(factor(time,c(1,3,6,24)), diff_expression,
+         group = geno, fill = geno) + geom_line()+
+    #stat_summary(geom="ribbon", size=0.5) +
+    #stat_summary(geom = "line", aes(color=interaction(geno), lty = geno), size=0.25) +
+    #facet_wrap(~value, ncol=1, scales="free_y")  +
+    scale_fill_manual(values = c("clustermut" = "red", "clusterwt" = "grey80")) +
+    theme_bw() +
+    theme(axis.line = element_line(color='black'), text = element_text(size=6, face="bold"), line = element_line(linewidth=0.25)) +
+    labs(x=NULL, y=NULL, color=NULL) +
+    scale_x_discrete(expand = c(0.05, 0)) +
+    NoLegend() +
+    geom_hline(yintercept=0, lty=2) 
+   
+
+ggsave("a.pdf")#, plot = glpr_time, h=2.5, w=3.5)
+```
+
+```{r}
+df <- enframe(clusters, name="SYMBOL")
+df <- inner_join(df, AnnotationDbi::select(org.Mm.eg.db, keys = df$SYMBOL,  columns="ENTREZID", keytype = "SYMBOL"))
+formula_res <- compareCluster(ENTREZID~value, data= df, fun="enrichGO", OrgDb = org.Mm.eg.db, ont="ALL",
+        minGSSize = 10, maxGSSize = 500, qvalue=5e-2,
+        universe = AnnotationDbi::select(org.Mm.eg.db, keys = res_treatment_lepip[[ct]]$gene,  columns="ENTREZID", keytype = "SYMBOL"))
+
+formula_res_simple <- simplify(formula_res, cutoff=0.8, by="p.adjust", select_fun=min)
+y <- setReadable(formula_res_simple, OrgDb = org.Mm.eg.db, keyType="ENTREZID")
+
+test <- fortify(formula_res, showCategory = 10)
+idx <- order(test[["GeneRatio"]], decreasing = T)
+test$Description <- factor(test$Description,
+                          levels=rev(unique(test$Description[idx])))
+
+test  %>%  filter(value==2)
+
+goenrich <- test  %>% 
+    mutate(order = as.numeric(Cluster))  %>% 
+    complete(Description, Cluster) %>%
+    ggplot() +
+    aes(x=Cluster, y = fct_reorder(str_wrap(Description,width=35), -order), fill = -log10(qvalue)) +
+    geom_tile(color="white", size=0.25) +
+    theme(panel.grid.major=element_blank(), panel.background = element_blank(), text = element_text(size=6, face="bold")) +
+    labs(x=NULL, y=NULL) +
+    scale_fill_steps(low = "white", high = "brown",  na.value = "grey") +
+    scale_y_discrete(position = "right")
+
+cowplot::plot_grid(glpr_time, goenrich, rel_widths=c(0.45,1))
+ggsave(paste0(fig_path_2,"glp1r_de_time_test.pdf"), h=4, w=5)
+```
+
+# Agrp Analysis
+```{r}
+ct <- "0"
+cormat <- dist(overlap_mat[[ct]])
+gene_hclust <- hclust(cormat, method="ward")
+dend <-  as.dendrogram(gene_hclust) 
+
+
+pdf("a.pdf")
+plot(dend)
+n = nrow(overlap_mat[[ct]])
+MidPoint = (gene_hclust$height[n-k] + gene_hclust$height[n-k+1]) / 2
+abline(h = MidPoint, lty=2)
+dev.off()
+
+clusters <- cutree(gene_hclust, k = 5)
+table(clusters)
+
+df <- bind_cols(data.frame(overlap_mat[[ct]], check.names=F), enframe(clusters)) %>% 
+     pivot_longer(c(-name, -value), names_to = "sample", values_to = "expression") %>% 
+    separate(sample, into  = c("hash.mcl.ID", "geno", "treatment", "time"), sep = "_")
+
+df %>% 
+    group_by(value, time, treatment, geno)  %>% 
+    mutate(mean = mean(expression))  %>% 
+    group_by(value, name)  %>% 
+    mutate(cor = cor(expression, mean))  %>%  distinct(name, .keep_all=T)  %>% 
+    arrange(value, -cor)  %>% 
+    filter(value==1)  %>% 
+    dplyr::select(name, treatment, time,geno, cor)  %>% 
+    print(n=20)
+   
+agrp_timeplot <- df %>% 
+    group_by(value, time, treatment, geno, hash.mcl.ID) %>% 
+    summarise(mean = mean(expression)) %>%
+    ggplot() +
+    aes(factor(time,c(1,3,6,24)), mean,
+         group = interaction(treatment, geno), color = interaction(treatment), lty = geno) +
+    stat_summary(geom="point", size=0.5) +
+    stat_summary(geom = "line", aes(color=interaction(treatment), lty = geno), size=0.25) +
+    facet_wrap(~value, ncol=1, scales="free_y", switch = "y")  +
+    scale_color_manual(values = c("Lep" = "red", "Sal" = "black")) +
+    theme(axis.line = element_line(color='black'),panel.background = element_blank(), text = element_text(size=6, face="bold"), line = element_line(linewidth=0.25),
+         plot.background = element_blank(), panel.grid.major = element_blank(),
+         panel.grid.minor = element_blank(), panel.border = element_blank(),strip.text = element_text(colour = 'black'),
+         strip.background = element_rect(fill="white"), strip.placement = "outside") +
+    labs(x=NULL, y=NULL, color=NULL) +
+    scale_x_discrete(expand = c(0.05, 0)) +
+    NoLegend()
+
+ggsave("a.pdf", plot = agrp_timeplot, h=5, w=2)
+```
+
+```{r}
+df <- enframe(clusters, name="SYMBOL")
+df <- inner_join(df, AnnotationDbi::select(org.Mm.eg.db, keys = df$SYMBOL,  columns="ENTREZID", keytype = "SYMBOL"))
+formula_res <- compareCluster(ENTREZID~value, data= df, fun="enrichGO", OrgDb = org.Mm.eg.db, ont="ALL",
+        minGSSize = 10, maxGSSize = 500, qvalue=5e-2,
+        universe = AnnotationDbi::select(org.Mm.eg.db, keys = res_treatment_lepip[[ct]]$gene,  columns="ENTREZID", keytype = "SYMBOL"))
+
+formula_res_simple <- simplify(formula_res, cutoff=0.5, by="p.adjust", select_fun=min)
+y <- setReadable(formula_res_simple, OrgDb = org.Mm.eg.db, keyType="ENTREZID")
+test <- fortify(y, showCategory = 3)
+idx <- order(test[["GeneRatio"]], decreasing = T)
+test$Description <- factor(test$Description,
+                          levels=rev(unique(test$Description[idx])))
+
+test  %>% filter(Cluster==1)
+goenrich <- test  %>% 
+    mutate(order = as.numeric(Cluster))  %>% 
+    complete(Description, Cluster) %>%
+    ggplot() +
+    aes(x=Cluster, y = fct_reorder(str_wrap(Description,width=35), -order), fill = -log10(qvalue)) +
+    geom_tile(color="white", size=0.25) +
+    theme(panel.grid.major=element_blank(), panel.background = element_blank(), text = element_text(size=6, face="bold")) +
+    labs(x=NULL, y=NULL) +
+    scale_fill_steps(low = "white", high = "brown",  na.value = "grey85") +
+    scale_y_discrete(position = "right")
+
+cowplot::plot_grid(agrp_timeplot, goenrich, rel_widths=c(0.4,1))
+ggsave(paste0(fig_path_2,"agrp_de_time_test.pdf"), h=4, w=5)
+```
+
+
+```{r}
+focus_1hr[["group"]] <- paste0(focus_1hr$labs, focus_1hr$treatment, focus_1hr$geno)
+min_cells <- min(table(focus_1hr[["group"]][,1]))
+equalnums <- as.character(unlist(tapply(colnames(focus_1hr), focus_1hr[["group"]][,1], function(x) sample(x, min_cells*0.9))))
+highlight_plot <- data.frame(focus_1hr@reductions$umap@cell.embeddings) %>%
+                        bind_cols(focus_1hr[[]]  %>% dplyr::select(geno, treatment, labs))  %>% 
+                        rownames_to_column("cell")  %>% 
+                        mutate(col = ifelse(cell %in% c(equalnums), "red", "grey50"))
+c <- ggplot(highlight_plot) +  aes(UMAP_1, UMAP_2, color=I(col), alpha=col) +
+  geom_point(size=0.25) +
+  theme_void() +
+  coord_equal() + guides(colour = guide_legend(override.aes = list(size=5)), alpha = guide_legend(override.aes = list(size=5)))
+ggsave(paste0(fig_path_1,"model_select.pdf"), h=3, w=3, plot = c+NoLegend())
+```
+
+
+```{r}
+   
+agrp_timeplot <- df %>% 
+    group_by(value, time, treatment, geno, hash.mcl.ID) %>% 
+    summarise(mean = mean(expression)) %>%
+    ggplot() +
+    aes(factor(time,c(1,3,6,24)), mean,
+         group = interaction(treatment, geno), color = interaction(treatment), lty = geno) +
+    stat_summary(geom="point", size=0.5) +
+    stat_summary(geom = "line", aes(color=interaction(treatment), lty = geno), size=0.25) +
+    facet_wrap(~value, ncol=1, scales="free_y", switch = "y")  +
+    scale_color_manual(values = c("Lep" = "red", "Sal" = "black")) +
+    theme(axis.line = element_line(color='black'),panel.background = element_blank(), text = element_text(size=6, face="bold"), line = element_line(linewidth=0.25),
+         plot.background = element_blank(), panel.grid.major = element_blank(),
+         panel.grid.minor = element_blank(), panel.border = element_blank(),strip.text = element_text(colour = 'black'),
+         strip.background = element_rect(fill="white"), strip.placement = "outside") +
+    labs(x=NULL, y=NULL, color=NULL) +
+    scale_x_discrete(expand = c(0.05, 0))
+```

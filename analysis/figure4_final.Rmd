@@ -1,0 +1,2248 @@
+```{r}
+library(Seurat)
+library(edgeR)
+library(tidyverse)
+library(targets)
+library(magrittr)
+library(irlba)
+library(caret)
+library(ggalluvial)
+
+library(RcppML)
+library(Matrix)
+library(fgsea)
+library(emmeans)
+library(clusterProfiler)
+library(variancePartition)
+library(org.Hs.eg.db)
+
+source("R/analysis_wrappers.R")
+source("R/basic_processing.R")
+source("R/helper_functions.R")
+
+fig_path_4 <- here::here("output_figures/figure4/")
+diet_deg <- read.csv(here::here("results/diet_pairwise_deg.csv"))
+agrp_lepip_deg <- read.csv(here::here("results/agrp_lep_goterm.csv"))
+glp1r_lepip_deg <- read.csv(here::here("results/glp1r_lep_clusters.csv"))
+
+
+leptin_geneset <- c("Socs3", "Atf3", "Etv6", "Serpina3h", "Timp1", "Serpina3i", "Nlrc5", "Gpr151", "Rdh10", "Arid5a", 
+                 "Steap4", "Sbno2", "Serpina3n", "Cpne8", "Gucy2c", "Drd1", "Prokr2", "Socs2", "Serpina3g", 
+                 "Cd24a", "C1qtnf7", "Vwa5a", "Gch1", "Nedd9", "Asb4", "Gna14", "Gcnt2", "Styk1", "Tnfrsf11b", 
+                 "Irf9", "Gadd45g", "Traf3ip3", "Stat3", "Lamc2", "Jun", "Thbd", "Esr2", "St18", "Trim62", 
+                 "Fam210b", "Stat2", "Txnrd1", "Arid5b", "Ikzf4", "Parp3", "Pros1", "Iqgap2", "Man1c1", "Nptx2", 
+                 "Palmd", "Bcl3", "Gnal", "Cish", "Khdrbs3", "Serpina3c", "Man2a1", "Prkar2b", "Shb", "Cul5", 
+                 "Pfkfb1", "Myo18b", "Pomc", "Rgs2", "Adra1a", "Necab1", "Skap2", "Magi3", "Ptger2", "Fgl2", 
+                 "Nr3c2", "Ldb2", "Arhgap6", "Srrm4", "Serpina3m", "Pde12", "Socs1", "Taf5")
+
+
+
+# Function to get top and bottom 10 genes for a group
+get_top_bottom_n <- function(group, n) {
+  total_rows <- nrow(group)
+  return(group %>%
+    arrange(desc(t)) %>%
+    dplyr::slice(c(1:n, (total_rows-n+1):total_rows)))
+}
+
+# Group by 'ct' and 'comp', then get top and bottom 10 for each group
+result <- diet_deg %>%
+  filter(ct%in% c(12,"Agrp"))  %>% 
+  group_by(ct, comp) %>%
+  do(get_top_bottom_n(.,50)) %>%
+  ungroup()  %>% 
+  mutate(group = interaction(ct, comp, sign(logFC)))  %>% 
+  dplyr::select(gene, group)  %>% 
+  bind_rows(
+    agrp_lepip_deg  %>% 
+      dplyr::select(gene,clusters)  %>% 
+      dplyr::rename(group = clusters)   %>% 
+      mutate(group=paste0("agrp_lep_",group))
+  )  %>% 
+  bind_rows(
+    glp1r_lepip_deg  %>% 
+      dplyr::select(gene,clusters)  %>% 
+      dplyr::rename(group = clusters)   %>% 
+      mutate(group=paste0("glp_lep_",group))
+  )  %>%
+  group_by(group)
+
+group_list <-  result  %>% 
+  group_split()  %>% 
+  purrr::map("gene")
+
+group_names <- result %>% 
+  group_keys() %>% 
+  pull(group)
+
+gene_sets <- set_names(group_list, group_names)
+
+term2gene <- data.frame(
+  term = rep(names(gene_sets), sapply(gene_sets, length)),
+  gene = unlist(gene_sets)
+)
+
+# Step 2: Prepare the TERM2NAME data frame (optional, for set descriptions)
+term2name <- data.frame(
+  term = names(gene_sets),
+  name = names(gene_sets)  # You can replace this with actual descriptions if available
+)
+
+targets::tar_load(arc_agrpko_labeled)
+targets::tar_load(arc_glp1rko_labeled)
+targets::tar_load(arc_diet_labeled)
+
+targets::tar_load(agrpko_celldist)
+targets::tar_load(glp1rko_celldist)
+
+targets::tar_load(pb_glp1rko)
+targets::tar_load(celltypes_glp1rko)
+names(pb_glp1rko) <- celltypes_glp1rko
+
+targets::tar_load(pb_agrpko)
+targets::tar_load(celltypes_agrpko)
+names(pb_agrpko) <- celltypes_agrpko
+```
+
+# get LEPR clusters
+```{r}
+DefaultAssay(arc_diet_labeled) <- "RNA"
+lepr_exp <- AverageExpression(arc_diet_labeled, features="Lepr", group.by="seurat_clusters")
+lepclus <- names(as.data.frame(lepr_exp$RNA))[which(lepr_exp$RNA>1)]
+lepclus <- lepclus[-5]
+```
+
+```{r}
+agrpko_umap <- DimPlot(arc_agrpko_labeled, group.by="predicted.celltype", shuffle=T, raster=T, reduction="ref.umap", label=T) 
+agrpko_geno <- DimPlot(arc_agrpko_labeled, group.by="geno", raster=T, shuffle=T, reduction="ref.umap", label=F)
+
+glp1rko_umap <- DimPlot(arc_glp1rko_labeled, group.by="predicted.celltype", shuffle=T,  raster=T, reduction="ref.umap", label=T) 
+glp1rko_geno <- DimPlot(arc_glp1rko_labeled, group.by="geno", raster=T, shuffle=T, reduction="ref.umap", label=F) 
+
+agrpko_umap + glp1rko_umap & cowplot::theme_map() & NoLegend()
+ggsave("ko_clustering_umaps.pdf", h=4,w=10)
+(agrpko_geno + NoLegend() )+ glp1rko_geno & cowplot::theme_map()
+ggsave("ko_geno_clustering_umaps.pdf", h=4,w=11)
+
+dev.off()
+```
+
+# Calculate LGS in AgRPKO neurons
+```{r}
+DefaultAssay(arc_agrpko_labeled) <- "RNA"
+arc_agrpko_labeled@meta.data <- arc_agrpko_labeled@meta.data[, !grepl("Cluster",colnames(arc_agrpko_labeled@meta.data))]
+arc_agrpko_labeled <- AddModuleScore(arc_agrpko_labeled, features=list(leptin_geneset))
+
+arc_agrpko_labeled[[]]  %>% 
+    dplyr::select(geno, diet, predicted.celltype, hash.mcl.ID, hash_pool, orig.ident, starts_with("Cluster"), sex)  %>% 
+    mutate(predicted.celltype = ifelse(predicted.celltype %in% c(28,32),28, predicted.celltype))  %>% 
+    group_by(geno, diet, predicted.celltype, orig.ident, hash.mcl.ID, hash_pool, sex)  %>% 
+    filter(predicted.celltype %in% "Agrp") %>%
+    ggplot() +
+    aes(x=geno, y=Cluster1, fill=geno) +
+    geom_violin() +
+    geom_boxplot(width=0.25) +
+    cowplot::theme_cowplot() +
+    cowplot::panel_border() +
+    facet_wrap(~diet, nrow=1)
+
+ggsave("agrp_leprko.pdf", h=3, w=6)
+
+ako <- arc_agrpko_labeled[[]]  %>% 
+    dplyr::select(geno, diet, predicted.celltype, hash.mcl.ID, hash_pool, orig.ident, starts_with("Cluster"), sex)  %>% 
+    mutate(predicted.celltype = ifelse(predicted.celltype %in% c(28,32),28, predicted.celltype))  %>% 
+    group_by(geno, diet, predicted.celltype, orig.ident, hash.mcl.ID, hash_pool, sex)  %>% 
+    filter(predicted.celltype %in% lepclus)  %>% 
+    summarise(mean = mean(Cluster1))  %>% 
+    ungroup()  %>% 
+    nest(-predicted.celltype)  %>% 
+    mutate(mod = purrr::map(data, function(x)  lme4::lmer(mean~geno*diet + sex + (1|hash.mcl.ID), data=x)))
+
+ako_emm <- purrr::map_dfr(ako$mod, ~emmeans::emmeans(.x, pairwise~diet|geno)$contrasts  %>%  data.frame(), .id="ct")  
+ako_emm
+
+
+ako_emm <- purrr::map(ako$mod, ~emmeans::emmeans(.x, pairwise~geno*diet))
+
+ako_res <- purrr::map_dfr(ako_emm, ~contrast(.x, list("DIO - Chow" = c(1, -1)), by="diet")  %>% data.frame(), .id="clus") %>% 
+    mutate(padj = p.adjust(p.value, method="BH"))  %>%   arrange(padj)  %>% 
+    mutate(ct = ako$predicted.celltype[as.numeric(clus)]) 
+    
+ako_diffdiff <- purrr::map_dfr(ako_emm, ~contrast(.x, list("DIO - Chow" = c(1, -1, -1, 1)))  %>% data.frame(), .id="clus") %>% 
+    mutate(padj = p.adjust(p.value))  %>%   arrange(padj)  %>% 
+    mutate(ct = ako$predicted.celltype[as.numeric(clus)]) 
+
+ako_lolli <- ako_res  %>% 
+  mutate(ct = lepclus[as.numeric(clus)])  %>% 
+  ggplot() +
+  aes(x=ct, y=estimate, color=diet) +
+  geom_linerange(aes(x = ct, ymin = 0, ymax = estimate, group=diet),  colour = "grey70",
+                   position = position_dodge(width = 0.5)) +
+  geom_point(position=position_dodge(width=0.5)) +
+  geom_hline(yintercept=0, lty=2) + labs(x=NULL)
+```
+
+# Calculate LGS in Glp1rKO neurons
+```{r}
+DefaultAssay(arc_glp1rko_labeled) <- "RNA"
+arc_glp1rko_labeled@meta.data <- arc_glp1rko_labeled@meta.data[, !grepl("Cluster",colnames(arc_glp1rko_labeled@meta.data))]
+arc_glp1rko_labeled <- AddModuleScore(arc_glp1rko_labeled, features=list(leptin_geneset))
+
+arc_glp1rko_labeled[[]]  %>% 
+    dplyr::select(geno, diet, predicted.celltype, hash.mcl.ID, hash_pool, orig.ident, starts_with("Cluster"), sex)  %>% 
+    mutate(predicted.celltype = ifelse(predicted.celltype %in% c(28,32),28, predicted.celltype))  %>% 
+    group_by(geno, diet, predicted.celltype, orig.ident, hash.mcl.ID, hash_pool, sex)  %>% 
+    filter(predicted.celltype %in% "12") %>%
+    ggplot() +
+    aes(x=geno, y=Cluster1, fill=geno) +
+    geom_violin() +
+    geom_boxplot(width=0.25) +
+    cowplot::theme_cowplot() +
+    cowplot::panel_border() +
+    facet_wrap(~diet, nrow=1)
+
+  
+ggsave('glp_leprko.pdf', h=3, w=6)
+
+gko <- arc_glp1rko_labeled[[]]  %>%  
+    dplyr::select(geno, diet, predicted.celltype, hash.mcl.ID, hash_pool, orig.ident, starts_with("Cluster"), sex)  %>% 
+    mutate(predicted.celltype = ifelse(predicted.celltype %in% c(28,32),28, predicted.celltype))  %>% 
+    group_by(geno, diet, predicted.celltype, orig.ident, hash.mcl.ID, hash_pool, sex)  %>% 
+    filter(predicted.celltype %in% lepclus)  %>% 
+    summarise(mean = mean(Cluster1))  %>% 
+    ungroup()  %>% 
+    nest(-predicted.celltype)  %>% 
+    mutate(mod = purrr::map(data, function(x)  lme4::lmer(mean~geno*diet + sex + (1|hash.mcl.ID), data=x)))
+
+car::Anova(gko$mod[[1]], type="II")
+
+gko_emm <- purrr::map_dfr(gko$mod, ~emmeans::emmeans(.x, pairwise~geno)$contrasts  %>%  data.frame(), .id="ct")
+gko_emm  %>%  mutate(padj = p.adjust(p.value))
+
+gko_emm <- purrr::map(gko$mod, ~emmeans::emmeans(.x, pairwise~geno*diet))
+
+gko_res <- purrr::map_dfr(gko_emm, ~contrast(.x, list("DIO - Chow" = c(1, -1)), by="diet")  %>% data.frame(), .id="clus") %>% 
+    mutate(padj = p.adjust(p.value))  %>%   arrange(padj)  %>% 
+    mutate(ct = gko$predicted.celltype[as.numeric(clus)]) 
+    
+gko_diffdiff <- purrr::map_dfr(gko_emm, ~contrast(.x, list("DIO - Chow" = c(1, -1, -1, 1)))  %>% data.frame(), .id="clus") %>% 
+    mutate(padj = p.adjust(p.value))  %>%   arrange(padj)  %>% 
+    mutate(ct = gko$predicted.celltype[as.numeric(clus)]) 
+
+gko_lolli <- gko_emm$contrast  %>% data.frame()  %>% 
+  ggplot() +
+  aes(x=predicted.celltype, y=estimate, color=diet) +
+  geom_linerange(aes(x = predicted.celltype, ymin = 0, ymax = estimate, group=diet),  colour = "grey70",
+                   position = position_dodge(width = 0.5)) +
+  geom_point(position=position_dodge(width=0.5)) +
+  geom_hline(yintercept=0, lty=2) + labs(x=NULL)
+```
+
+# plot change in LGS in both datasets
+```{r}
+lgs_plot <- gko_res  %>% 
+  data.frame()   %>% 
+  mutate(ko = "glp")  %>% 
+  bind_rows(
+    ako_res  %>% 
+      data.frame()  %>% 
+      mutate(ko = "agrp")
+  ) 
+  
+lgs_plot  %>% 
+  ggplot() +  geom_errorbar(aes(y=ct, x=estimate, xmin = estimate-SE*1.96, xmax=estimate+SE*1.96, color=diet), width=0, position=position_dodge(width=0.5), linewidth=0.75) +
+  geom_point(shape=21, stroke=1, aes(y=ct, x=estimate, fill=diet, color=I(ifelse(padj<0.05, "black", "grey50"))), size=3, position=position_dodge(width=0.5)) +
+  geom_vline(xintercept=0, lty=2) + labs(x=NULL) +
+  scale_x_continuous(breaks = c(-0.2,-0.1,0)) +
+  facet_wrap(~ko, ncol=1, scales="free_y") +
+  cowplot::theme_half_open() + cowplot::panel_border() +
+  scale_fill_manual(values=c("DIO" = "#E8682F","Chow"= "#F0AD74")) +
+  scale_color_manual(values=c("DIO" = "#E8682F","Chow"= "#F0AD74")) +
+  NoLegend() + labs(y=NULL) 
+
+ggsave("a.pdf", h=5,w=2.5)
+```
+
+```{r}
+arc_agrpko_labeled[[]]  %>%  
+  distinct(hash.mcl.ID, .keep_all=T)  %>%  
+  dplyr::select(hash.mcl.ID, weight, diet, geno)   %>% 
+  mutate(weight=as.numeric(weight),  group="agrp")  %>% 
+  bind_rows(
+    arc_glp1rko_labeled[[]]  %>%  
+    distinct(hash.mcl.ID, .keep_all=T)  %>%  
+    dplyr::select(hash.mcl.ID, weight, diet, geno)   %>% 
+    mutate(weight=as.numeric(weight), group="glp1r")  %>% 
+    full_join(
+      data.frame(
+        hash.mcl.ID = c("G0245", "G0239", "G0046", "G0238", "G0045", "G0049", "G0247", "G0246", "G0244", 
+             "G0241", "G0240", "G0237", "G0048"),
+        weight_new = c(51.03, 67.61, 49.47, 38.38, 48.42, 50.62, 37.91, 36.06, 42.9, 
+             54.74, 51.68, 53.62, 50.41),
+        diet = rep("DIO", 13)
+  )))  %>% 
+  mutate(weight = ifelse(is.na(weight), weight_new, weight)) %>% 
+  lm(weight~diet*geno, data=.)  %>% 
+  emmeans(., pairwise~geno|diet)
+```
+
+```{r}
+agrp_projected <- project_pca(
+  ref_data = subset(arc_diet_labeled, subset = treatment %in% c("HFD", "Chow", "Fast")),
+  new_data = arc_agrpko_labeled, 
+  celltype = "Agrp", 
+  n_pcs = 20
+)
+
+bg_data <- rbind(agrp_projected$ref_pca  %>% mutate(geno = "ctrl"),  agrp_projected$ref_pca %>% mutate(geno = "ctrl")) 
+
+agrp_projected$new_data_pca_scores  %>%
+  bind_rows(bg_data)  %>% 
+  mutate(diet = ifelse(treatment == "Fast", "Fast", diet))  %>% 
+  ggplot() +
+  geom_point(aes(PC1, PC2, color=diet), size=1, alpha=0.6) +
+  scale_color_manual(values=c("DIO" = "#E8682F","Chow"= "#F0AD74", "Fast" = "#165C5B")) +
+  facet_grid(~geno) + cowplot::theme_half_open() + cowplot::panel_border() + cowplot::background_grid() 
+
+agrp_projected$new_data_pca_scores  %>%
+  bind_rows(bg_data)  %>% 
+  mutate(diet = ifelse(treatment == "Fast", "Fast", diet))  %>% 
+  ggplot() +
+  aes(x=PC1, y= geno, fill=diet) +
+  ggridges::geom_density_ridges()
+
+ggsave("a.pdf", h=3, w=8)
+```
+
+```{r}
+ref_data = subset(arc_diet_labeled, subset = treatment %in% c("HFD", "Chow", "Fast"))
+new_data = arc_agrpko_labeled
+celltype = "Agrp"
+n_pcs = 20
+
+# Subset the reference and new data based on provided cluster and cell type
+ref_subset <- subset(ref_data, subset = seurat_clusters == celltype)
+new_subset <- subset(new_data, subset = predicted.celltype == celltype)
+  
+# Find shared features
+shared_feats <- intersect(rownames(ref_subset), rownames(new_subset))
+  
+# Process the reference data
+ref_subset <- process_seurat(subset(ref_subset, features = shared_feats), method = "integrate", batch = "hash_pool", cluster = FALSE, nfeats = 5000)
+  
+# Perform PCA on the reference data
+ref_mat <- ref_subset@assays$integrated@scale.data
+ref_pca <- prcomp(t(ref_mat), center = FALSE, scale. = FALSE)
+
+lda_model <- lda(ref_subset$treatment ~ PC1 + PC2, data = data.frame(ref_pca$x))
+lda_1d <- predict(lda_model)$x
+
+# Normalize and scale the new data using the reference's variable features
+new_subset <- NormalizeData(new_subset) %>% ScaleData(., features = VariableFeatures(ref_subset))
+scale_mat <- new_subset@assays$RNA@scale.data
+
+# Align the rows of the new data's scaled matrix with the reference matrix
+scale_mat <- scale_mat[match(rownames(ref_mat), rownames(scale_mat)),]
+# Project the new data into the PCA space of the reference data
+new_data_pca_scores <- as.matrix(t(scale_mat)) %*% ref_pca$rotation  %>% data.frame() 
+lda_1d_pred <- predict(lda_model, new_data_pca_scores)$x
+
+lda_1d_pred%>% bind_cols(new_subset[[]] %>%  dplyr::select(geno, treatment)) %>%
+ ggplot() + 
+ ggridges::geom_density_ridges(aes(LD1, y = treatment, fill=geno), alpha=0.25) 
+```
+
+```{r}
+ref_data = subset(arc_diet_labeled, subset = treatment %in% c("HFD", "Chow", "Fast"))
+new_data = arc_glp1rko_labeled
+celltype = "12"
+n_pcs = 20
+
+# Subset the reference and new data based on provided cluster and cell type
+ref_subset <- subset(ref_data, subset = seurat_clusters == celltype)
+new_subset <- subset(new_data, subset = predicted.celltype == celltype)
+  
+# Find shared features
+shared_feats <- intersect(rownames(ref_subset), rownames(new_subset))
+  
+# Process the reference data
+ref_subset <- process_seurat(subset(ref_subset, features = shared_feats), method = "integrate", batch = "hash_pool", cluster = FALSE, nfeats = 5000)
+  
+# Perform PCA on the reference data
+ref_mat <- ref_subset@assays$integrated@scale.data
+ref_pca <- prcomp(t(ref_mat), center = T, scale. = FALSE)
+
+lda_model <- MASS::lda(ref_subset$treatment ~ ., data = data.frame(ref_pca$x)[,1:10])
+lda_1d <- predict(lda_model)$x
+
+# Normalize and scale the new data using the reference's variable features
+new_subset <- NormalizeData(new_subset) %>% ScaleData(., features = VariableFeatures(ref_subset))
+scale_mat <- new_subset@assays$RNA@scale.data
+
+# Align the rows of the new data's scaled matrix with the reference matrix
+scale_mat <- scale_mat[match(rownames(ref_mat), rownames(scale_mat)),]
+# Project the new data into the PCA space of the reference data
+new_data_pca_scores <- as.matrix(t(scale_mat)) %*% ref_pca$rotation  %>% data.frame() 
+lda_1d_pred <- predict(lda_model, new_data_pca_scores)$x
+
+lda_1d_pred%>% bind_cols(new_subset[[]] %>%  dplyr::select(geno, treatment)) %>%
+ ggplot() + 
+ ggridges::geom_density_ridges(aes(LD1, y = geno, fill=treatment),scale = 0.9, alpha=0.25, rel_min_height = 0.02) +
+ cowplot::theme_cowplot() +
+ cowplot::background_grid()
+
+ggsave("ridges.pdf", h=2, w=6)
+
+glp_projected <- project_pca(
+  ref_data = subset(arc_diet_labeled, subset = treatment %in% c("HFD", "Chow", "Fast")),
+  new_data = arc_glp1rko_labeled, 
+  celltype = "12", 
+  n_pcs = 20
+)
+
+bg_data <- rbind(glp_projected$ref_pca  %>% mutate(geno = "ctrl"),  glp_projected$ref_pca %>% mutate(geno = "ctrl")) 
+
+glp_projected$new_data_pca_scores  %>%
+  bind_rows(bg_data)  %>% 
+  mutate(diet = ifelse(treatment == "Fast", "Fast", diet))  %>% 
+  ggplot() +
+  geom_point(aes(PC1, PC2, color=diet), size=1, alpha=0.6) +
+  scale_color_manual(values=c("DIO" = "#E8682F","Chow"= "#F0AD74", "Fast" = "#165C5B")) +
+  facet_grid(~geno) + cowplot::theme_half_open() + cowplot::panel_border() + cowplot::background_grid() 
+
+glp_projected$new_data_pca_scores  %>%
+  bind_rows(bg_data)  %>% 
+  mutate(diet = ifelse(treatment == "Fast", "Fast", diet))  %>% 
+  ggplot() +
+  aes(x=PC1, y= geno, fill=diet) +
+  ggridges::geom_density_ridges()
+
+dev.off()
+
+ggsave("a.pdf", h=3, w=8)
+```
+
+```{r}
+glp_projected_agrp <- project_pca(
+  ref_data = subset(arc_diet_labeled, subset = treatment %in% c("HFD", "Chow")),
+  new_data = merge(subset(arc_glp1rko_labeled, subset = predicted.celltype=="Agrp"),
+                   subset(arc_agrpko_labeled, subset = predicted.celltype=="Agrp")),
+  celltype = "Agrp", 
+  n_pcs = 20
+)
+
+bg_data <- rbind(glp_projected_agrp$ref_pca  %>% mutate(geno = "ctrl"),  glp_projected_agrp$ref_pca %>% mutate(geno = "ctrl")) 
+
+# Split the data into features (X) and target variable (y)
+X <- glp_projected_agrp$ref_pca %>% dplyr::select(paste0("PC",1:5), treatment)
+y <- glp_projected_agrp$ref_pca$treatment
+
+# Train the multinomial logistic regression model
+model <- glm(factor(treatment) ~ ., data=X, family="binomial")
+
+predictions <- predict(model, newdata = glp_projected_agrp$new_data_pca_scores, type = "response")  %>% 
+  data.frame(class = ., glp_projected_agrp$new_data_pca_scores) 
+
+prediction_ave <- predictions %>% 
+  dplyr::select(dataset,hash.mcl.ID, geno, diet,sex, class)  %>%  
+  group_by(dataset, geno, hash.mcl.ID,sex, diet)  %>% 
+  summarise(mean = mean(class))  
+
+prediction_ave  %>% 
+  filter(dataset=="agrpfl")  %>% 
+  ggplot() +
+  aes(x=diet, y=mean, fill=geno)  +
+  geom_boxplot() +
+  geom_point(position = position_dodge(width=0.9)) +
+  cowplot::theme_cowplot() 
+
+ggsave("a.pdf", h=4,w=4)
+
+out <- prediction_ave  %>% 
+  lm(mean~dataset*geno*diet+sex, data=.)  %>% 
+  emmeans(., ~ dataset*geno*diet)
+
+pairs(out, by=c("dataset"))  %>% 
+  data.frame()  %>% arrange(dataset)  %>% 
+  mutate(padj = p.adjust(p.value))
+```
+
+```{r}
+pbd <-  pb_glp1rko[["12"]]
+pbd$samples$group <- interaction(pbd$samples$geno, pbd$samples$diet)
+design <- model.matrix(~0+group+sex, data=pbd$samples)
+colnames(design) <- gsub(":", "_", colnames(design))
+fitd <- voomLmFit(pbd, design)
+
+contrast.matrix <- makeContrasts(
+  d = groupmut.DIO - groupwt.DIO,
+  c = groupmut.Chow - groupwt.Chow,
+  d_c = groupmut.DIO - groupmut.Chow,
+  d_d = (groupwt.DIO - groupwt.Chow),
+  levels = design
+)
+
+# Fit the contrast
+fitd <- voomLmFit(pbd, design)
+fit2 <- contrasts.fit(fitd, contrast.matrix)
+fit2 <- eBayes(fit2, robust=F)
+chow_degs <- topTable(fit2, n=Inf, coef = "c")
+dio_degs <- topTable(fit2, n=Inf, coef = "d")
+dim(dio_degs %>% filter(adj.P.Val <0.05))
+
+chow_degs  %>% write_csv("glp1r_chow_ko_deg.csv")
+dio_degs  %>% write_csv("glp1r_dio_ko_deg.csv")
+
+p1 <- enframe(rowMeans(edgeR::cpm(pbd, prior.count=3, log=T)[,pbd$samples$group=="wt.Chow"]))  %>% 
+  inner_join(enframe(rowMeans(edgeR::cpm(pbd, prior.count=3, log=T)[,pbd$samples$group=="mut.Chow"])), by="name")  %>% 
+  ggplot() +
+  aes(value.x, value.y) +
+  geom_point(shape=".", aes(color=I(ifelse(name %in% rownames(chow_degs), "red","grey")))) +
+  ggrepel::geom_text_repel(aes(label = ifelse(name %in% rownames(chow_degs[chow_degs$adj.P.Val<1e-2,]), name, NA_character_)))
+
+p2 <- enframe(rowMeans(edgeR::cpm(pbd, prior.count=3, log=T)[,pbd$samples$group=="wt.DIO"]))  %>% 
+  inner_join(enframe(rowMeans(edgeR::cpm(pbd, prior.count=3, log=T)[,pbd$samples$group=="mut.DIO"])), by="name")  %>% 
+  ggplot() +
+  aes(value.x, value.y) +
+  geom_point(shape=".", aes(color=I(ifelse(name %in% rownames(dio_degs), "red","grey")))) +
+  ggrepel::geom_text_repel(aes(label = ifelse(name %in% c("Fos","Homer1", "Vgf"), name, NA_character_)))
+
+p1+p2 & NoLegend() & cowplot::theme_cowplot()
+ggsave("a.pdf", h=6, w=12)
+
+dio_list <- dio_degs$logFC * -log10(dio_degs$P.Value)
+names(dio_list) <- rownames(dio_degs)
+dio_list <- sort(dio_list, decreasing=T)
+
+ego3 <- gseGO(geneList     = dio_list,
+              OrgDb        = org.Mm.eg.db,
+              keyType      = "SYMBOL",
+              ont          = "ALL",
+              minGSSize    = 10,
+              maxGSSize    = 300,
+              pvalueCutoff = 0.05,
+              verbose      = FALSE)
+
+ego3@result  %>% select(-leading_edge,-core_enrichment)  %>% filter(NES>0)  %>% head
+```
+
+```{r}
+pbd <-  pb_glp1rko[["Agrp"]]
+pbd$samples$group <- interaction(pbd$samples$geno, pbd$samples$diet)
+design <- model.matrix(~0+group+sex, data=pbd$samples)
+colnames(design) <- gsub(":", "_", colnames(design))
+fitd <- voomLmFit(pbd, design)
+
+contrast.matrix <- makeContrasts(
+  d = groupmut.DIO - groupwt.DIO,
+  c = groupmut.Chow - groupwt.Chow,
+  d_c = groupmut.DIO - groupmut.Chow,
+  d_d = (groupwt.DIO - groupwt.Chow),
+  levels = design
+)
+
+# Fit the contrast
+fitd <- voomLmFit(pbd, design)
+fit2 <- contrasts.fit(fitd, contrast.matrix)
+fit2 <- eBayes(fit2, robust=F)
+chow_degs <- topTable(fit2, n=Inf, coef = "c")
+dio_degs <- topTable(fit2, n=Inf, coef = "d")
+
+dim(chow_degs %>% filter(adj.P.Val < 0.05))
+dim(dio_degs %>% filter(adj.P.Val < 0.05))
+
+bind_rows(chow_degs,dio_degs, .id="diet")  %>% 
+  ggplot() +
+  aes(x=logFC, y=-log10(adj.P.Val)) + 
+  geom_point(aes(color=I(ifelse(adj.P.Val<0.05&abs(logFC)>0.25, "red", "grey80")))) +
+  cowplot::theme_cowplot() +
+  ggrepel::geom_text_repel(aes(label = ifelse(adj.P.Val<0.05&abs(logFC)>0.25, gene, NA_character_))) +
+  facet_wrap(~diet)
+ggsave("volc_agrp_glp1r.pdf", h=5, w=7)
+
+chow_degs  %>% write_csv("glp1r_agrp_chow_ko_deg.csv")
+dio_degs  %>% write_csv("glp1r_agrp_dio_ko_deg.csv")
+
+p1 <- enframe(rowMeans(edgeR::cpm(pbd, prior.count=3, log=T)[,pbd$samples$group=="wt.Chow"]))  %>% 
+  inner_join(enframe(rowMeans(edgeR::cpm(pbd, prior.count=3, log=T)[,pbd$samples$group=="mut.Chow"])), by="name")  %>% 
+  ggplot() +
+  aes(value.x, value.y) +
+  geom_point(shape=".", aes(color=I(ifelse(name %in% rownames(chow_degs[chow_degs$adj.P.Val < 0.05,]), "red","grey")))) +
+  ggrepel::geom_text_repel(aes(label = ifelse(name %in% rownames(chow_degs[chow_degs$adj.P.Val<0.05,]), name, NA_character_)))
+
+p2 <- enframe(rowMeans(edgeR::cpm(pbd, prior.count=3, log=T)[,pbd$samples$group=="wt.DIO"]))  %>% 
+  inner_join(enframe(rowMeans(edgeR::cpm(pbd, prior.count=3, log=T)[,pbd$samples$group=="mut.DIO"])), by="name")  %>% 
+  ggplot() +
+  aes(value.x, value.y) +
+  geom_point(shape=".", aes(color=I(ifelse(name %in% rownames(dio_degs[dio_degs$adj.P.Val < 0.05,]), "red","grey")))) +
+  ggrepel::geom_text_repel(aes(label = ifelse(name %in% rownames(dio_degs[dio_degs$adj.P.Val<0.05,]), name, NA_character_)))
+
+p1+p2 & NoLegend() & cowplot::theme_cowplot()
+ggsave("a.pdf", h=6, w=12)
+
+dio_list <- dio_degs$logFC * -log10(dio_degs$P.Value)
+names(dio_list) <- rownames(dio_degs)
+dio_list <- sort(dio_list, decreasing=T)
+
+ego3 <- gseGO(geneList     = dio_list,
+              OrgDb        = org.Mm.eg.db,
+              keyType      = "SYMBOL",
+              ont          = "ALL",
+              minGSSize    = 10,
+              maxGSSize    = 300,
+              pvalueCutoff = 0.05,
+              verbose      = FALSE)
+
+ego3@result  %>% select(-leading_edge,-core_enrichment)  %>% filter(NES>0)  %>% head
+```
+
+```{r}
+pbd <-  pb_agrpko[["Agrp"]]
+pbd$samples$group <- interaction(pbd$samples$geno, pbd$samples$diet)
+design <- model.matrix(~0+group+sex, data=pbd$samples)
+colnames(design) <- gsub(":", "_", colnames(design))
+fitd <- voomLmFit(pbd, design)
+
+contrast.matrix <- makeContrasts(
+  d = groupmut.DIO - groupwt.DIO,
+  c = groupmut.Chow - groupwt.Chow,
+  d_c = groupmut.DIO - groupmut.Chow,
+  d_d = (groupwt.DIO - groupwt.Chow),
+  levels = design
+)
+
+# Fit the contrast
+fitd <- voomLmFit(pbd, design)
+fit2 <- contrasts.fit(fitd, contrast.matrix)
+fit2 <- eBayes(fit2, robust=F)
+chow_degs <- topTable(fit2, n=Inf, coef = "c")
+dio_degs <- topTable(fit2, n=Inf, coef = "d")
+
+dim(chow_degs %>% filter(adj.P.Val < 0.05))
+dim(dio_degs %>% filter(adj.P.Val < 0.05))
+
+
+bind_rows(chow_degs,dio_degs, .id="diet")  %>% 
+  ggplot() +
+  aes(x=logFC, y=-log10(adj.P.Val)) + 
+  geom_point(aes(color=I(ifelse(adj.P.Val<0.05&abs(logFC)>0.25, "red", "grey80")))) +
+  cowplot::theme_cowplot() +
+  ggrepel::geom_text_repel(aes(label = ifelse(adj.P.Val<0.05&abs(logFC)>0.25, gene, NA_character_))) +
+  facet_wrap(~diet)
+
+ggsave("volc_agrp_agrp.pdf", h=5, w=7)
+
+chow_degs  %>% write_csv("agrpko_agrp_chow_ko_deg.csv")
+dio_degs  %>% write_csv("agrpko_agrp_dio_ko_deg.csv")
+
+p1 <- enframe(rowMeans(edgeR::cpm(pbd, prior.count=3, log=T)[,pbd$samples$group=="wt.Chow"]))  %>% 
+  inner_join(enframe(rowMeans(edgeR::cpm(pbd, prior.count=3, log=T)[,pbd$samples$group=="mut.Chow"])), by="name")  %>% 
+  ggplot() +
+  aes(value.x, value.y) +
+  geom_point(shape=".", aes(color=I(ifelse(name %in% rownames(chow_degs[chow_degs$adj.P.Val < 0.05,]), "red","grey")))) +
+  ggrepel::geom_text_repel(aes(label = ifelse(name %in% rownames(chow_degs[chow_degs$adj.P.Val<0.05,]), name, NA_character_)))
+
+p2 <- enframe(rowMeans(edgeR::cpm(pbd, prior.count=3, log=T)[,pbd$samples$group=="wt.DIO"]))  %>% 
+  inner_join(enframe(rowMeans(edgeR::cpm(pbd, prior.count=3, log=T)[,pbd$samples$group=="mut.DIO"])), by="name")  %>% 
+  ggplot() +
+  aes(value.x, value.y) +
+  geom_point(shape=".", aes(color=I(ifelse(name %in% rownames(dio_degs[dio_degs$adj.P.Val < 0.05,]), "red","grey")))) +
+  ggrepel::geom_text_repel(aes(label = ifelse(name %in% rownames(dio_degs[dio_degs$adj.P.Val<0.05,]), name, NA_character_)))
+
+p1+p2 & NoLegend() & cowplot::theme_cowplot()
+ggsave("a.pdf", h=6, w=12)
+
+dio_list <- dio_degs$logFC * -log10(dio_degs$P.Value)
+names(dio_list) <- rownames(dio_degs)
+dio_list <- sort(dio_list, decreasing=T)
+
+ego3 <- gseGO(geneList     = dio_list,
+              OrgDb        = org.Mm.eg.db,
+              keyType      = "SYMBOL",
+              ont          = "ALL",
+              minGSSize    = 10,
+              maxGSSize    = 300,
+              pvalueCutoff = 0.05,
+              verbose      = FALSE)
+
+ego3@result  %>% select(-leading_edge,-core_enrichment)  %>% filter(NES>0)  %>% head
+```
+
+```{r}
+agrp_sets <- gene_sets[grep("Agrp.hvc|Agrp.fvc",names(gene_sets), ignore.case=T)]
+DefaultAssay(arc_glp1rko_labeled) <- "RNA"
+
+agrp_ako <- subset(arc_glp1rko_labeled, subset = predicted.celltype == "Agrp")
+agrp_ako@meta.data <- agrp_ako@meta.data[, !grepl("Cluster",colnames(agrp_ako@meta.data))]
+agrp_ako <- AddModuleScore(agrp_ako, features = agrp_sets, assay="RNA")
+
+
+de_ako_data <- agrp_ako[[]]  %>% 
+  dplyr::select(geno, diet, predicted.celltype, hash.mcl.ID, starts_with("Cluster"))  %>% 
+  pivot_longer(starts_with("Cluster"))  %>% 
+  group_by(geno, diet, predicted.celltype, hash.mcl.ID,  name)  %>% 
+  summarise(mean = mean(value))  %>% 
+  mutate( name = gsub("Cluster","", name), name = names(agrp_sets)[as.numeric(name)])
+
+ggplot(de_ako_data) +
+aes(x=name, y=mean, fill=geno) +
+geom_boxplot() +
+facet_wrap(~diet) +
+cowplot::theme_cowplot() +
+theme(axis.text.x=element_text(angle=45, hjust=1))
+
+ggsave("agrp_diet_sets.pdf", h=4,w=6)
+
+de_ako_models <- de_ako_data %>% 
+  nest(-name)  %>% 
+  #filter(name!="Cluster3")  %>% 
+  mutate(model = purrr::map(data, ~lm(mean ~ geno*diet, data=.x))) 
+
+de_ako_leptin <- purrr::map_dfr(de_ako_models$model, ~data.frame(emmeans::emmeans(.x, pairwise~geno|diet)$contrasts), .id="clus") %>% 
+                  mutate(comp = names(agrp_sets)[as.numeric(clus)])
+
+de_ako_leptin  %>%  mutate(padj = p.adjust(p.value))
+
+DefaultAssay(arc_diet_labeled) <- "RNA"
+FeaturePlot(arc_diet_labeled, "Ghsr", order=T) + cowplot::theme_map()
+ggsave("ghsr.pdf", h=6,w=6)
+```
+
+```{r}
+dat <- glp1rko_celldist$results %>% janitor::clean_names() %>% rownames_to_column("group") %>% 
+    separate(group, into = c("clus","diet")) 
+dat <- agrpko_celldist$results %>% janitor::clean_names() %>% rownames_to_column("group") %>% 
+    separate(group, into = c("clus","diet")) 
+
+dat  %>% 
+  group_by(clus)  %>% 
+  mutate(max = max(dist))  %>% 
+  arrange(-max)   %>% 
+  slice(1:20)
+
+dio_df <- dat %>% filter(diet == 'DIO') %>% dplyr::select(clus, dist, x95_percent_ci_low, x95_percent_ci_upper, padj)
+chow_df <- dat %>% filter(diet == 'Chow') %>% dplyr::select(clus, dist, x95_percent_ci_low, x95_percent_ci_upper, padj)
+
+# Merging on clus
+merged_df <- merge(dio_df, chow_df, by="clus", suffixes = c("_dio", "_chow"))
+
+
+# Plotting
+p <- merged_df  %>% 
+  ggplot(., aes(dist_dio, dist_chow, color=I(case_when(padj_dio<0.05&padj_chow<0.05 ~ "red",
+                                                     padj_dio<0.05&padj_chow>0.05 ~ "black",
+                                                     T ~ "grey80")))) +
+  #geom_errorbar(aes(xmin=x95_percent_ci_low, xmax=x95_percent_ci_upper), width=0, position=position_dodge(width=0.25)) +
+  geom_point(size=3, position=position_dodge(width=0.25)) +
+  theme_classic() +
+  #theme(axis.text.y=element_blank(), axis.ticks.y=element_blank()) +
+  #facet_wrap(~fct_reorder(clus, -dist), scales="free_y", ncol=1, strip.position="left") +
+  labs(y=NULL, color=NULL) +
+  geom_abline(lty=2) +
+  ggbreak::scale_x_break(c(15, 30)) +
+  ggrepel::geom_text_repel(aes(label=clus))
+
+p
+
+# Plotting
+p <- merged_df  %>% 
+  group_by(clus)  %>% 
+  mutate(max = max(dist))  %>% 
+  arrange(-max)   %>% 
+  ungroup()  %>% 
+  dplyr::slice(1:30)  %>% 
+  ggplot(., aes(y=fct_reorder(clus, dist), x=dist, color=diet)) +
+  geom_errorbar(aes(xmin=x95_percent_ci_low, xmax=x95_percent_ci_upper), width=0, position=position_dodge(width=0.25)) +
+  geom_point(size=3, position=position_dodge(width=0.25)) +
+  theme_classic() +
+  theme(axis.text.y=element_blank(), axis.ticks.y=element_blank()) +
+  facet_wrap(~fct_reorder(clus, -dist), scales="free_y", ncol=1, strip.position="left") +
+  labs(y=NULL, color=NULL)
+
+p
+
+ggsave("a.pdf", h=4, w=4, plot = print(p+coord_equal() + coord_flip()))
+```
+
+```{r}                             
+agrp_projected_chow <- project_pca(
+  ref_data = subset(arc_diet_labeled, subset = treatment %in% c("Chow","Fast","HFD")),
+  new_data = merge(subset(arc_glp1rko_labeled, subset = predicted.celltype=="Agrp"),
+                   subset(arc_agrpko_labeled, subset = predicted.celltype=="Agrp")),
+  celltype = "Agrp", 
+  n_pcs = 20
+)
+
+bg_data <- rbind(agrp_projected_chow$ref_pca  %>% mutate(geno = "ctrl"),  agrp_projected_chow$ref_pca %>% mutate(geno = "ctrl")) 
+
+agrp_projected_chow$new_data_pca_scores  %>%
+  bind_rows(bg_data)  %>% 
+  mutate(diet = ifelse(treatment == "Fast", "Fast", diet))  %>% 
+  ggplot() +
+  geom_point(aes(PC1,PC2, color=diet), size=1, alpha=0.6) +
+  scale_color_manual(values=c("DIO" = "#E8682F","Chow"= "#F0AD74", "Fast" = "#165C5B")) +
+  facet_grid(~geno*dataset) + cowplot::theme_half_open() + cowplot::panel_border() + cowplot::background_grid() 
+
+ggsave("a.pdf", h=3, w=8)
+```
+
+# projection analysis
+```{r}
+agrp_projected_chow <- project_pca(
+  ref_data = subset(arc_diet_labeled, subset = treatment %in% c("Chow","Fast")),
+  new_data = subset(arc_glp1rko_labeled, diet == "Chow"),
+  celltype = "Agrp", 
+  n_pcs = 20
+)
+
+X <- agrp_projected_chow$ref_pca %>% dplyr::select(paste0("PC",1:20), treatment)  %>%  mutate(treatment = factor(treatment))
+train_control <- trainControl(method = "cv", number = 10)  # 10-fold cross-validation
+# Train the model using cross-validation
+
+# Train the logistic regression model using cross-validation
+model_cv <- train(treatment ~ ., 
+                  data = X, 
+                  method = "glm", 
+                  family = "binomial",
+                  trControl = train_control)
+
+# Summarize the results
+control_predictions <- data.frame(predicted = predict(model_cv, newdata = X  %>% filter(treatment == "Chow")), diet = "Chow",
+                                  hash.mcl.ID =  agrp_projected_chow$ref_pca$hash.mcl.ID[agrp_projected_chow$ref_pca$treatment == "Chow"],
+                                  geno = agrp_projected_chow$ref_pca$geno[agrp_projected_chow$ref_pca$treatment == "Chow"],
+                                  dataset = agrp_projected_chow$ref_pca$dataset[agrp_projected_chow$ref_pca$treatment == "Chow"]) 
+
+knockout_predictions <- data.frame(predicted = predict(model_cv, newdata =  agrp_projected_chow$new_data_pca_scores), 
+                                   diet = "Chow", hash.mcl.ID =  agrp_projected_chow$new_data_pca_scores$hash.mcl.ID,
+                                   geno = agrp_projected_chow$new_data_pca_scores$geno,
+                                   dataset = agrp_projected_chow$new_data_pca_scores$dataset)
+
+allpreds <- knockout_predictions  %>% mutate(set = "test")  %>% 
+  bind_rows(control_predictions  %>% mutate(set = "train"))  %>% 
+  mutate(class = ifelse(predicted != diet, 1, 0)) 
+
+allpreds  %>% 
+  group_by(geno, diet, set, dataset, predicted)  %>% 
+  summarise(tot = n())  %>% 
+  group_by(geno, diet, set, dataset)  %>% 
+  mutate(perc = tot/sum(tot))  %>% 
+  filter(set!="train")  %>% 
+  ggplot(aes(y = perc, x = interaction(geno, set), fill = factor(predicted))) +
+  geom_flow(aes(alluvium = factor(predicted)), alpha= .5, color = "white",
+            curve_type = "linear", 
+            width = .5) +
+  geom_col(width = .5, color = "white") +
+  scale_fill_brewer(palette = "RdBu")+
+  scale_y_continuous(NULL, expand = c(0,0)) +
+  cowplot::theme_half_open() +
+  theme(panel.grid.major = element_blank(), strip.background = element_blank()) +  NoLegend() +
+  scale_fill_manual(values=c("HFD" = "#E8682F","Chow"= "#F0AD74", "Fast" = "#165C5B")) +
+  scale_y_continuous(labels=scales::percent) +
+  labs(x=NULL, y=NULL)
+
+ggsave("a.pdf", h=3, w=2)
+```
+
+```{r}
+agrp_projected_chow <- project_pca(
+  ref_data = subset(arc_diet_labeled, subset = treatment %in% c("Chow","HFD")),
+  new_data = merge(subset(arc_glp1rko_labeled, subset = predicted.celltype=="Agrp"&diet == "DIO"),
+                   subset(arc_agrpko_labeled, subset = predicted.celltype=="Agrp"&diet == "DIO")),
+  celltype = "Agrp", 
+  n_pcs = 20
+)
+
+X <- agrp_projected_chow$ref_pca %>% dplyr::select(paste0("PC",1:20), treatment)  %>%  mutate(treatment = factor(treatment))
+train_control <- trainControl(method = "cv", number = 10)  # 10-fold cross-validation
+# Train the model using cross-validation
+
+# Train the logistic regression model using cross-validation
+model_cv <- train(treatment ~ ., 
+                  data = X, 
+                  method = "glm", 
+                  family = "binomial",
+                  trControl = train_control)
+
+# Summarize the results
+control_predictions <- data.frame(predicted = predict(model_cv, newdata = X), diet = X$treatment,
+                                  hash.mcl.ID =  agrp_projected_chow$ref_pca$hash.mcl.ID,
+                                  geno = agrp_projected_chow$ref_pca$geno,
+                                  dataset = agrp_projected_chow$ref_pca$dataset)  
+
+knockout_predictions <- data.frame(predicted = predict(model_cv, newdata =  agrp_projected_chow$new_data_pca_scores), 
+                                   diet = "HFD", hash.mcl.ID =  agrp_projected_chow$new_data_pca_scores$hash.mcl.ID,
+                                   geno = agrp_projected_chow$new_data_pca_scores$geno,
+                                   dataset = agrp_projected_chow$new_data_pca_scores$dataset)  
+
+allpreds <- knockout_predictions  %>% mutate(set = "test")  %>% 
+  bind_rows(control_predictions  %>% mutate(set = "train"))  %>% 
+  mutate(diet = ifelse(diet=="DIO", "HFD", diet))  %>% 
+  mutate(class = ifelse(predicted != diet, 1, 0)) 
+
+allpreds  %>% 
+  group_by(geno, diet, set, class, dataset)  %>% 
+  summarise(tot = n())  %>% 
+  group_by(geno, diet, set, dataset)  %>% 
+  mutate(perc = tot/sum(tot))  %>% 
+  filter(dataset == "glp1rleprko")  %>% 
+  ggplot(aes(y = perc, x = interaction(geno,set), fill = factor(class))) +
+  geom_flow(aes(alluvium = factor(class)), alpha= .5, color = "white",
+            curve_type = "linear", 
+            width = .5) +
+  geom_col(width = .5, color = "white") +
+  scale_fill_brewer(palette = "RdBu")+
+  scale_y_continuous(NULL, expand = c(0,0)) +
+  cowplot::theme_half_open() +
+  theme(panel.grid.major = element_blank(), strip.background = element_blank()) +
+  facet_wrap(~diet) + NoLegend() +
+  scale_y_continuous(labels=scales::percent) +
+  labs(x=NULL, y=NULL)
+
+ggsave("a.pdf", h=3, w=3)
+```
+
+# classification analysis
+```{r}
+# Split the data into features (X) and target variable (y)
+X <- agrp_projected$ref_pca %>% dplyr::select(paste0("PC",1:20), treatment)
+train_control <- trainControl(method = "cv", number = 10)  # 10-fold cross-validation
+# Train the model using cross-validation
+model_cv <- train(treatment ~., 
+                  data = X, 
+                  method = "multinom", 
+                  trControl = train_control)
+
+# Summarize the results
+control_predictions <- data.frame(predicted = predict(model_cv, newdata = X), diet = y,
+                                  hash.mcl.ID =  agrp_projected$ref_pca$hash.mcl.ID,
+                                  geno = agrp_projected$ref_pca$geno,
+                                  dataset = agrp_projected$ref_pca$dataset)
+
+knockout_predictions <- data.frame(predicted = predict(model_cv, newdata =  agrp_projected$new_data_pca_scores), 
+                                   diet = agrp_projected$new_data_pca_scores$diet, hash.mcl.ID =  agrp_projected$new_data_pca_scores$hash.mcl.ID,
+                                   geno = agrp_projected$new_data_pca_scores$geno,
+                                   dataset = agrp_projected$new_data_pca_scores$dataset)
+
+allpreds <- knockout_predictions  %>% mutate(set = "test")  %>% 
+  bind_rows(control_predictions  %>% mutate(set = "train"))  %>% 
+  mutate(diet = ifelse(diet=="DIO", "HFD", diet))  %>% 
+  mutate(class = ifelse(predicted != diet, 1, 0)) 
+
+allpreds  %>% 
+  group_by(geno, diet, set, class, dataset)  %>% 
+  summarise(tot = n())  %>% 
+  group_by(geno, diet, set, dataset)  %>% 
+  mutate(perc = tot/sum(tot))  %>% 
+  ggplot(aes(y = perc, x = interaction(geno,set), fill = factor(class))) +
+  geom_flow(aes(alluvium = factor(class)), alpha= .5, color = "white",
+            curve_type = "linear", 
+            width = .5) +
+  geom_col(width = .5, color = "white") +
+  scale_fill_brewer(palette = "RdBu")+
+  scale_y_continuous(NULL, expand = c(0,0)) +
+  cowplot::theme_half_open() +
+  theme(panel.grid.major = element_blank(), strip.background = element_blank()) +
+  facet_wrap(~diet*dataset) + NoLegend() +
+  scale_y_continuous(labels=scales::percent) +
+  labs(x=NULL, y=NULL)
+
+ggsave("a.pdf")
+
+emmeans(model, pairwise~geno|diet*dataset)$contrasts 
+
+
+
+table(knockout_predictions$predictions, knockout_predictions$geno, knockout_predictions$truth, knockout_predictions$dataset)
+table(control_group$predicted, control_group$geno, control_group$diet)
+
+# Calculate misclassification rates
+misclassification_rate_ko <- mean(ko_group$predicted != ko_group$diet)
+misclassification_rate_control <- mean(control_group$predicted != control_group$diet)
+
+knockout_confusion_matrix <- table(Predicted = knockout_predictions, geno = glp_projected$new_data_pca_scores$geno)
+# Calculate accuracy
+knockout_accuracy <- sum(diag(knockout_confusion_matrix)) / sum(knockout_confusion_matrix)
+# Print confusion matrix and accuracy
+print(knockout_confusion_matrix)
+print(paste("Accuracy on Knockout Dataset:", knockout_accuracy))
+
+library(ggplot2)
+glp_projected_agrp$new_data_pca_scores  %>% 
+  ggplot() + aes(PC1,PC2) +
+  geom_point() +
+  facet_wrap(~dataset)
+dev.off()
+# Create a combined data frame for visualization
+glp_projected$new_data_pca_scores$predicted <- knockout_predictions
+X$group <- "Normal"
+glp_projected$new_data_pca_scores$group <- "Knockout"
+combined_data <- rbind(X[,c("predicted","group")], glp_projected$new_data_pca_scores[,c("predicted","group")])
+
+# Plot the distribution of predicted diet types by group
+ggplot(combined_data, aes(x = predicted, fill = group)) +
+    geom_bar(position = "dodge") +
+    labs(title = "Distribution of Predicted Diet Types: Normal vs Knockout",
+         x = "Predicted Diet Type",
+         y = "Count") +
+    theme_minimal()
+
+length(knockout_predictions)
+
+# Train the multinomial logistic regression model
+model <- nnet::multinom(treatment ~ ., data=X)
+
+predictions <- predict(model, newdata = glp_projected$new_data_pca_scores, type = "class")  %>% 
+  data.frame(class = ., glp_projected$new_data_pca_scores) 
+
+  bind_cols(glp_projected$new_data_pca_scores) %>%
+  pivot_longer(1:3)  %>% 
+  dplyr::select(value, name, geno, diet, hash.mcl.ID, hash_pool, orig.ident) 
+
+
+  
+summary(model)
+
+  
+glp_projected$new_data_pca_scores  %>% 
+  group_by(geno, diet,predicted)  %>% 
+  summarise(tot = n())  %>% 
+  group_by(geno, diet)  %>% 
+  mutate(perc = tot/sum(tot))  %>% 
+  ggplot(aes(y = perc, x = factor(geno, c("wt","mut")), fill = factor(predicted, c("HFD", "Chow","Fast")))) +
+  geom_flow(aes(alluvium = factor(predicted, c("HFD", "Chow","Fast"))), alpha= .5, color = "white",
+            curve_type = "linear", 
+            width = .5) +
+  geom_col(width = .5, color = "white") +
+  scale_fill_brewer(palette = "RdBu")+
+  scale_y_continuous(NULL, expand = c(0,0)) +
+  cowplot::theme_half_open() +
+  theme(panel.grid.major = element_blank(), strip.background = element_blank()) +
+  facet_wrap(~diet) + NoLegend() +
+  scale_fill_manual(values=c("HFD" = "#E8682F","Chow"= "#F0AD74", "Fast" = "#165C5B")) +
+  scale_y_continuous(labels=scales::percent) +
+  labs(x=NULL, y=NULL)
+
+ggsave("a.pdf", h=3, w=3)
+diffs <- predictions  %>% 
+  nest(-name)  %>% 
+  mutate(mod = purrr::map(data, ~lme4::lmer(value~geno*diet +(1|hash.mcl.ID) + (1|orig.ident), data=.x)))
+  
+purrr::map_dfr(diffs$mod, function(x) {
+  emmeans::emmeans(x, pairwise~geno|diet, pbkrtest.limit = 3562, lmerTest.limit = 3562) %$%
+  contrasts  %>%  data.frame()
+  }, .id="trt")  %>% 
+  mutate(trt = diffs$name[as.numeric(trt)])  %>% 
+  mutate(padj = p.adjust(p.value))  %>% 
+  dplyr::select(-contrast)  %>% arrange(diet)
+```
+
+
+
+
+```{r}
+# Split the data into features (X) and target variable (y)
+X <- agrp_projected$ref_pca %>% dplyr::select(paste0("PC",1:10), treatment)
+y <- agrp_projected$ref_pca$treatment
+
+# Train the multinomial logistic regression model
+model <- nnet::multinom(treatment ~ ., data=X)
+
+predictions <- predict(model, newdata = agrp_projected$new_data_pca_scores, type = "class")  %>% 
+  data.frame(class = ., agrp_projected$new_data_pca_scores) 
+
+library(ggalluvial)
+## first need to calcualte the actual percentage by group
+predictions %>%
+  dplyr::select(geno, diet, class)  %>%  
+  group_by(geno, diet,class)  %>% 
+  summarise(tot = n())  %>% 
+  group_by(geno, diet)  %>% 
+  mutate(perc = tot/sum(tot))  %>% 
+  ggplot(aes(y = perc, x = factor(geno, c("wt","mut")), fill = as.character(class))) +
+  geom_flow(aes(alluvium = class), alpha= .5, color = "white",
+            curve_type = "linear", 
+            width = .5) +
+  geom_col(width = .5, color = "white") +
+  scale_fill_brewer(palette = "RdBu")+
+  scale_y_continuous(NULL, expand = c(0,0)) +
+  cowplot::theme_minimal_hgrid() +
+  theme(panel.grid.major = element_blank(), 
+        axis.text.y = element_blank(), 
+        axis.ticks.y = element_blank()) +
+  facet_wrap(~diet) + NoLegend() +
+  scale_fill_manual(values=c("HFD" = "#E8682F","Chow"= "#F0AD74", "Fast" = "#165C5B")) +
+  labs(x=NULL)
+ggsave("b.pdf", h=3, w=3)
+
+predictions <- predict(model, newdata = agrp_projected$new_data_pca_scores, type = "prob")  %>% 
+  bind_cols(agrp_projected$new_data_pca_scores)  %>% 
+  pivot_longer(1:3) 
+  #data.frame(hfd_vals = ., agrp_projected$new_data_pca_scores) %>%
+  #dplyr::select(hfd_vals, geno, diet, hash.mcl.ID, hash_pool, orig.ident) 
+
+diffs <- predictions  %>% 
+  nest(-name)  %>% 
+  mutate(mod = purrr::map(data, ~lme4::lmer(value~geno*diet +(1|hash.mcl.ID) + (1|orig.ident), data=.x)))
+  
+purrr::map_dfr(diffs$mod, function(x) {
+  emmeans::emmeans(x, pairwise~geno|diet, pbkrtest.limit = 3562, lmerTest.limit = 3562) %$%
+  contrasts  %>%  data.frame()
+  }, .id="trt")  %>% 
+  mutate(trt = diffs$name[as.numeric(trt)])  %>% 
+  mutate(padj = p.adjust(p.value))  %>% 
+  dplyr::select(-contrast)  %>% arrange(diet)
+
+#diffs <- lme4::lmer(hfd_vals~geno*diet + (1|hash.mcl.ID) + (1|orig.ident), data= predictions)
+  
+#diffs  %>% 
+#  emmeans::emmeans(., pairwise~geno|diet, pbkrtest.limit = 3562, lmerTest.limit = 3562) %$%
+#  contrasts  %>% data.frame()  %>% 
+#  mutate(padj = p.adjust(p.value)) 
+```
+
+```{r}
+# Split the data into features (X) and target variable (y)
+X <- agrp_projected$ref_pca %>% dplyr::select(paste0("PC",1:10), treatment)
+y <- agrp_projected$ref_pca$treatment
+
+# Train the multinomial logistic regression model
+model <- nnet::multinom(treatment ~ ., data=X)
+
+predictions <- predict(model, newdata = agrp_projected$new_data_pca_scores, type = "prob")  %>% 
+  data.frame(vals = ., agrp_projected$new_data_pca_scores) %>%
+  dplyr::select(vals, geno, diet, hash.mcl.ID, hash_pool, orig.ident) 
+
+diffs <- predictions  %>% 
+  nest(-name)  %>% 
+  mutate(mod = purrr::map(data, ~lme4::lmer(value~geno*diet +(1|hash.mcl.ID) + (1|orig.ident), data=.x)))
+  
+purrr::map_dfr(diffs$mod, function(x) {
+  emmeans::emmeans(x, pairwise~geno|diet, pbkrtest.limit = 3562, lmerTest.limit = 3562) %$%
+  contrasts  %>%  data.frame()
+  }, .id="trt")  %>% 
+  mutate(trt = diffs$name[as.numeric(trt)])  %>% 
+  mutate(padj = p.adjust(p.value))  %>% 
+  dplyr::select(-contrast)  %>% arrange(diet)
+  
+  
+  #group_by(hash.mcl.ID, name, geno, diet)  %>% 
+  #summarise(mean = mean(value))  %>% 
+  
+predictions  %>% 
+  group_by(hash.mcl.ID, geno, diet)  %>% 
+  summarise(mean = mean(vals))  %>% 
+  ggplot() +
+  aes(geno, y=mean) +
+  geom_boxplot() +
+  facet_wrap(~giet)
+
+ggsave("a.pdf",h=3)
+
+table(predictions, agrp_projected$new_data_pca_scores$diet, agrp_projected$new_data_pca_scores$geno)
+
+ggplot(agrp_projected$new_data_pca_scores  %>%  filter(geno=="wt")) +
+  aes(PC1, PC2) +
+  geom_point(data=agrp_projected$ref_pca, aes(color=treatment)) +
+  geom_point(aes(shape=diet)) 
+
+ggplot(agrp_projected$new_data_pca_scores  %>%  filter(geno=="mut")) +
+  aes(PC1, PC2) +
+  geom_point(data=agrp_projected$ref_pca, aes(color=treatment)) +
+  geom_point(aes(shape=diet)) 
+
+ggsave("agrp_refpca.pdf", h=4, w=6)
+
+agrp_projected <- project_pca(
+  ref_data = arc_diet_labeled, 
+  new_data = arc_glp1rko_labeled, 
+  celltype = "Agrp", 
+  n_pcs = 10
+)
+
+agrp_gko_wt <- ggplot(agrp_projected$new_data_pca_scores  %>%  filter(diet=="Chow")) +
+  aes(PC1, PC2) +
+  geom_point(data=agrp_projected$ref_pca, aes(shape=treatment)) +
+  geom_point(aes(color=geno)) 
+
+agrp_gko_mut <- ggplot(agrp_projected$new_data_pca_scores  %>%  filter(diet=="DIO")) +
+  aes(PC1, PC2) +
+  geom_point(data=agrp_projected$ref_pca, aes(shape=treatment)) +
+  geom_point(aes(color=geno)) 
+
+agrp_gko_wt + agrp_gko_mut
+
+ggsave("glp1r_refpca.pdf", h=4, w=12)
+```
+
+```{r}
+pca_sig <- agrp_projected$new_data_pca_scores  %>% 
+    dplyr::select(geno, diet, hash.mcl.ID, hash_pool, orig.ident, starts_with("PC"))  %>% 
+    pivot_longer(starts_with("PC"))  %>% 
+    group_by(geno, diet, hash.mcl.ID, hash_pool, orig.ident, name)  %>% 
+    #filter(predicted.celltype %in% lepclus)  %>% 
+    summarise(mean = mean(value))   %>% 
+    filter(name %in% c(paste0("PC",1:10)))  %>% 
+    nest(-name)  %>% 
+    mutate(mod = purrr::map(data, function(x) lme4::lmer(mean~geno*diet + (1|hash.mcl.ID), data=x)))
+
+purrr::map_dfr(pca_sig$mod, ~emmeans::emmeans(.x, pairwise~geno|diet)$contrasts  %>%  data.frame(), .id="pc")  %>% 
+    mutate(padj = p.adjust(p.value))  %>% 
+    mutate(ct = pca_sig$name[as.numeric(pc)])  %>%  
+    #filter(contrast != "Fast - HFD", contrast != "HFD - Refeed", contrast !="Chow - Refeed")  %>%  
+    arrange(estimate) 
+```
+
+# Calculate changes in agrp target genes from all previous studies
+```{r}
+agrp_sets <- gene_sets[grep("agrp",names(gene_sets), ignore.case=T)]
+DefaultAssay(arc_agrpko_labeled) <- "RNA"
+agrp_ako <- subset(arc_agrpko_labeled, subset = predicted.celltype == "Agrp")
+agrp_ako@meta.data <- agrp_ako@meta.data[, !grepl("Cluster",colnames(agrp_ako@meta.data))]
+agrp_ako <- AddModuleScore(agrp_ako, features = agrp_sets, assay="RNA")
+
+de_ako_models <- agrp_ako[[]]  %>% 
+  #dplyr::select(geno, diet, predicted.celltype, hash.mcl.ID,  hash_pool, orig.ident, starts_with("Cluster"))  %>% 
+  pivot_longer(starts_with("Cluster"))  %>% 
+  #group_by(geno, diet, predicted.celltype, orig.ident, hash.mcl.ID,name, hash_pool, seq_pool, sex)  %>% 
+  #summarise(mean = mean(value))  %>% 
+  nest(-name)  %>% 
+  #filter(name!="Cluster3")  %>% 
+  mutate(model = purrr::map(data, ~lme4::lmer(value ~ geno*diet + (1|hash.mcl.ID) + (1|sex) + (1|hash_pool), data=.x, REML=T))) 
+
+de_ako_leptin <- purrr::map_dfr(de_ako_models$model, ~data.frame(emmeans::emmeans(.x, pairwise~geno|diet)$contrasts), .id="clus") %>% 
+                  mutate(comp = names(agrp_sets)[as.numeric(clus)])
+
+de_ako_leptin  %>%  arrange(estimate)
+
+vp_ako_leptin <- agrp_ako[[]]  %>% 
+  pivot_longer(starts_with("Cluster"))  %>% 
+  nest(-name)  %>% 
+  mutate(model = purrr::map(data, ~lme4::lmer(value ~ (1|geno) + (1|diet) + (1|geno:diet) + (1|hash_pool) +(1|hash.mcl.ID) + (1|sex), data=.x, REML=F))) 
+
+varpart_ako <- purrr::map_dfr(vp_ako_leptin$model, calcVarPart, .id="clus")  %>% 
+  janitor::clean_names()  %>% 
+  mutate(clus=vp_ako_leptin$name) 
+  
+varpart_ako  %>% pivot_longer(-clus)  %>% ggplot() + aes(x=name, y=value) + geom_boxplot()
+dev.off()  
+
+varpart_ako  %>% 
+  pivot_longer(-clus)  %>% 
+  group_by(clus)  %>% 
+  mutate(order = value[name=="geno"])  %>% 
+  ggplot() +
+  aes(fct_reorder(clus,order), y=value, fill=name) +
+  geom_col(color="black") +
+  coord_flip()
+
+dev.off()
+```
+
+# Calculate changes in glp1r neurons from all previous studies
+```{r}
+glp1r_sets <- gene_sets[-grep("agrp",names(gene_sets), ignore.case=T)]
+DefaultAssay(arc_glp1rko_labeled) <- "RNA"
+glp1r_gko <- subset(arc_glp1rko_labeled, subset = predicted.celltype == "12")
+glp1r_gko@meta.data <- glp1r_gko@meta.data[, !grepl("Cluster",colnames(glp1r_gko@meta.data))]
+glp1r_gko <- AddModuleScore(glp1r_gko, features = c(glp1r_sets), assay="RNA")
+
+
+de_gko_models <- glp1r_gko[[]]  %>% 
+  dplyr::select(geno, diet, predicted.celltype, hash.mcl.ID,  hash_pool, orig.ident, starts_with("Cluster"))  %>% 
+  pivot_longer(starts_with("Cluster"))  %>% 
+  group_by(geno, diet, predicted.celltype, orig.ident, hash.mcl.ID,name, hash_pool, seq_pool, sex)  %>% 
+  summarise(mean = mean(value))  %>% 
+  nest(-name)  %>% 
+  #filter(name!="Cluster3")  %>% 
+  mutate(model = purrr::map(data, ~lme4::lmer(value ~ (1|geno + (1|diet) + (1|hash.mcl.ID) + (1|sex), data=.x, REML=F))) 
+
+de_gko_leptin <- purrr::map_dfr(de_gko_models$model, ~data.frame(emmeans::emmeans(.x, pairwise~geno)$contrasts), .id="clus") %>% 
+                        mutate(comp = names(glp1r_sets)[as.numeric(clus)])
+
+
+volc_gko <- de_gko_leptin  %>%  ggplot() +
+  aes(estimate, -log10(p.adjust(p.value))) +
+  geom_point() +
+  ggrepel::geom_text_repel(aes(label=comp)) +
+  lims(x=c(-0.5,0.5), y=c(0,10)) +
+  theme_bw()
+
+vp_gko_leptin <- glp1r_gko[[]]  %>% 
+  pivot_longer(starts_with("Cluster"))  %>% 
+  nest(-name)  %>% 
+  mutate(model = purrr::map(data, ~lme4::lmer(value ~ (1|geno) + (1|diet) + (1|geno:diet) + (1|hash_pool) +(1|hash.mcl.ID) + (1|sex), data=.x, REML=F))) 
+
+varpart_gko <- purrr::map_dfr(vp_gko_leptin$model, calcVarPart, .id="clus")  %>% 
+  janitor::clean_names()  %>% 
+  mutate(clus = names(glp1r_sets)[as.numeric(clus)])
+
+varpart_gko  %>% 
+  pivot_longer(-clus)  %>% 
+  ggplot() + 
+  aes(x=name, y=value) +
+  geom_jitter(width=0.5) +
+  ggrepel::geom_text_repel(aes(label=clus)) +
+  cowplot::theme_half_open() +
+  theme(axis.text.x=element_text(angle=45, hjust=1)) +
+  labs(y="Variance Explained", x=NULL)
+ggsave("box.pdf", h=4, w=6)
+
+vp_bar <- varpart_gko  %>% 
+  pivot_longer(-clus)  %>% 
+  group_by(clus)  %>% 
+  mutate(order = value[name=="residuals"])  %>% 
+  mutate(fill = ifelse(name %in% c("geno", "geno_diet", "diet"), name, "residuals"))  %>% 
+  ggplot() +
+  aes(fct_reorder(clus,order), y=value, fill=fill) +
+  geom_col(color="black") +
+  coord_flip() + labs(y="Variance Explained", x=NULL) +
+  cowplot::theme_minimal_hgrid() +
+  theme(panel.grid.major=element_blank())
+
+vp_bar 
+ggsave("a.pdf",h=4, w=6)
+
+glp1r_gko[[]]  %>% 
+  dplyr::select(geno, diet, predicted.celltype, hash.mcl.ID,  hash_pool, orig.ident, starts_with("Cluster"))  %>% 
+  pivot_longer(starts_with("Cluster"))  %>% 
+  group_by(geno, diet, predicted.celltype, orig.ident, hash.mcl.ID,name, hash_pool)  %>% 
+  summarise(mean = mean(value))  %>% 
+  filter(name%in%c("Cluster4","Cluster1"))  %>% 
+  ggplot() +
+  aes(x=diet, mean, fill=geno) +
+  geom_violin( position = position_dodge(0.9)) +
+  geom_boxplot(width=0.25,  position = position_dodge(0.9)) +
+  facet_wrap(~name, scales="free_y", nrow=1)  +
+  cowplot::theme_half_open() + cowplot::panel_border() +cowplot::background_grid()
+  
+ggsave("a.pdf", h=3, w=6)
+
+model_gko_leptin <- glp1r_gko[[]]  %>% 
+  dplyr::select(geno, diet, predicted.celltype, hash.mcl.ID,  hash_pool, orig.ident, starts_with("Cluster"))  %>% 
+  pivot_longer(starts_with("Cluster"))  %>% 
+  filter(name%in%c("Cluster4","Cluster1"))  %>% 
+  group_by(geno, diet, predicted.celltype, orig.ident, hash.mcl.ID, name, hash_pool)  %>% 
+  summarise(mean = mean(value))  %>% 
+  nest(-name)  %>% 
+  #filter(name!="Cluster3")  %>% 
+  mutate(model = purrr::map(data, ~lme4::lmer(mean ~ geno*diet + (1|hash.mcl.ID), data=.x, REML=T))) 
+
+purrr::map_dfr(model_gko_leptin$model, calcVarPart, .id="clus")  %>% 
+  janitor::clean_names()  %>% 
+  mutate(clus=model_gko_leptin$name)  %>% 
+  arrange(desc(geno_diet))  %>% 
+  pivot_longer(-clus)  %>% 
+  group_by(clus)  %>% 
+  mutate(order = value[name=="residuals"])  %>% 
+  ggplot() +
+  aes(fct_reorder(clus,order), y=value, fill=name) +
+  geom_col(color="black") +
+  coord_flip()
+dev.off()
+
+emm_gko <- model_gko_leptin$model[[2]]  %>%   
+  emmeans::emmeans(., pairwise~geno*diet) 
+
+pairs(emm_gko, adjust='bon')
+
+library(ggbreak)
+
+emm_gko$contrasts  %>% data.frame()  %>% mutate(padj = -log10(p.adjust(p.value)))  %>% arrange(p.value)
+  ggplot() + aes(x=estimate, y=padj) + geom_jitter() + ggrepel::geom_text_repel(aes(label=name)) +
+  theme_bw()
+
+ggsave("a.pdf", h=3,w=5)
+
+contrast_result <- model_gko_leptin  %>% 
+                   emmeans::emmeans(., pairwise~geno|name*diet)  %>% 
+                    contrast(., 
+                            method = list("(mut-wt)_HFD - (mut-wt)_Chow" = c(1, -1, -1, 1)),
+                            by = "name")
+
+contrast_result %>% data.frame()%>% arrange(estimate)
+```
+
+
+```{r}
+all_agrp <- merge(agrp_ako, agrp_gko)
+all_agrp <- process_seurat(all_agrp, method="integrate", batch="dataset", res=0.1, dims=15)
+agrp <- subset(arc_diet_labeled, subset = seurat_clusters == "Agrp")
+agrp <- process_seurat(agrp, method="integrate",batch="hash_pool", return_model=T, res=0.1, dims=10)
+DimPlot(all_agrp, group.by="geno", split.by ="dataset", reduction="pca", c(1,5)) 
+dev.off()
+
+agrp_ko@reductions$ref.pca@cell.embeddings   %>% 
+  data.frame()  %>%  
+  bind_cols(agrp_ko[[]])  %>% 
+  ggplot() +
+  aes(dataset, refpca_5, fill=interaction(diet,geno)) +
+  geom_boxplot()
+
+dev.off()
+agrp_ko <- project_umap(query = all_agrp, ref = agrp, dims = 10, label_to_transfer="seurat_clusters", 
+             reference.assay = "integrated", query.assay = "RNA")
+```
+
+
+
+```{r}
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+
+pbd <-  pb_glp1rko[["Agrp"]]
+design <- model.matrix(~0+group, data=pbd$samples %>% mutate(group = interaction(geno, diet)))
+colnames(design) <- gsub(":", "_", colnames(design))
+contrast.matrix <- makeContrasts(
+  d = groupmut.DIO - groupwt.DIO,
+  c = groupmut.Chow - groupwt.Chow,
+  d_c = (groupmut.DIO + groupmut.Chow)/2 - (groupwt.DIO+ groupwt.Chow)/2,
+  d_d = (groupmut.DIO - groupmut.Chow) - (groupwt.DIO - groupwt.Chow),
+  stand = (groupwt.DIO - groupwt.Chow),
+  levels = design
+)
+
+# Fit the contrast
+fitd <- voomLmFit(pbd, design)
+fit2 <- contrasts.fit(fitd, contrast.matrix)
+fit2 <- eBayes(fit2, robust=F)
+alldeg <- topTable(fit2, coef = "d", n = Inf) %>% mutate(comp = "mut.DIO") %>%
+                bind_rows(topTable(fit2, coef = "c", n = Inf) %>% mutate(comp = "mut.Chow")) %>%
+                bind_rows(topTable(fit2, coef = "d_c", n = Inf) %>% mutate(comp = "mut.Chow.DIO"))  %>% 
+                bind_rows(topTable(fit2, coef = "d_d", n = Inf) %>% mutate(comp = "diff.diff"))
+
+write.csv(alldeg, "results/glpko_pairwise_deg.csv")
+
+mapping.data1 <- read.table(gzfile("/projects/perslab/data/yggdrasil/projects/mludwig/Ludwig-2021/data/gene_info/Mus_musculus.GRCm38.90.gene_name_version2ensembl.txt.gz"), header=T)
+mapping.data2 <- read.table(gzfile("/projects/perslab/data/yggdrasil/projects/mludwig/Ludwig-2021/data/gene_info/map_hsapiens_mmusculus.gz"), header = T)
+mapping.data3 <- read.csv("/projects/perslab/data/yggdrasil/projects/mludwig/DVC/data/gene_info/NCBI37.3.gene.loc", sep = "", header = F)
+colnames(mapping.data3) <- c("ENTREZID", "chr", "start", "end", "strand", "ALIAS")
+
+for_magma <- alldeg  %>%
+  dplyr::select(gene, logFC, comp, adj.P.Val)  %>% 
+  mutate(logFC=abs(logFC*-log10(adj.P.Val)))  %>% 
+  dplyr::select(-adj.P.Val)  %>% 
+  dplyr::rename(symbol=gene)  %>% 
+  pivot_wider(names_from=comp, values_from=logFC)  %>% 
+  inner_join(alldeg  %>% group_by(gene)  %>% 
+                         summarise(mean = mean(AveExpr))  %>%
+                         dplyr::select(gene,mean), by=c("symbol"="gene"))
+
+genes_converted <- data.frame(convert_mouse_to_human(for_magma$symbol)) %>% filter(!duplicated(X1))
+genes_entrez <- AnnotationDbi::select(org.Hs.eg.db,
+                            keys = genes_converted$X2,
+                            columns = c("ENTREZID", "SYMBOL"),
+                            keytype = "SYMBOL")  %>% 
+                            filter(!duplicated(SYMBOL))
+humdeg <- inner_join(genes_entrez, genes_converted, by=c("SYMBOL" = "X2"))  %>% 
+    inner_join(for_magma, by=c("X1"="symbol"))  %>% dplyr::select(c(-SYMBOL,-X1))  %>%
+    dplyr::rename(GENE=ENTREZID)  %>% 
+    filter(!duplicated(GENE))  %>% 
+    mutate(GENE=as.numeric(GENE)) 
+ 
+write.table(humdeg, file="../magma_genesets/glpko_test.txt", sep = "\t", quote=F, row.names=F)
+
+ 
+for_ldsc <- alldeg  %>% mutate(comp = paste0(ifelse(logFC>0, "pos.", "neg."), comp))  %>%  
+  dplyr::select(gene, adj.P.Val, comp)  %>% 
+  dplyr::rename(symbol=gene)  %>% 
+  pivot_wider(names_from=comp, values_from=adj.P.Val)  %>% 
+  mutate(across(where(is.numeric), ~ ifelse(. < 0.05, 1, 0)))
+
+for_ldsc$gene <- mapping.data1$ensembl_gene_id[match(for_ldsc$symbol, mapping.data1$gene_name_optimal)]
+for_ldsc$gene <- mapping.data2$ensembl_gene_id[
+  match(for_ldsc$gene, mapping.data2$mmusculus_homolog_ensembl_gene)]
+for_ldsc <- for_ldsc[!is.na(for_ldsc$gene),]
+covar_file <- read.csv("/projects/perslab/people/lhv464/glp1r_leptin/results/tabula_muris.mu.csv", header=T)
+for_ldsc <- for_ldsc[, c(ncol(for_ldsc), 2:(ncol(for_ldsc)-1))]  %>%  
+  inner_join(., covar_file  %>% dplyr::select(Brain_Non.Myeloid.neuron, gene))  %>% 
+  janitor::clean_names() 
+for_ldsc[is.na(for_ldsc)] <- 0
+
+colSums(for_ldsc[,-1])
+
+write.table(for_ldsc,
+           file = "/projects/perslab/people/lhv464/glp1r_leptin/results/LDSC_input_glpko_glp1r_genes_FDR_05.csv",
+            row.names = F, sep = ",")
+
+filtdeg <- alldeg  %>%  filter(adj.P.Val<0.1)  %>% 
+        mutate(group = interaction(comp))
+
+humdeg <- purrr::map_dfr(split(filtdeg$gene, f=filtdeg$group), function(x) {
+            if(length(x)>10) {
+                genes_converted <- data.frame(convert_mouse_to_human(x)) %>% filter(!duplicated(X1))
+                genes_entrez <- AnnotationDbi::select(org.Hs.eg.db,
+                            keys = genes_converted$X2,
+                            columns = c("ENTREZID", "SYMBOL"),
+                            keytype = "SYMBOL")  %>% 
+                            filter(!duplicated(SYMBOL))
+                return(genes_entrez)
+            } else {
+                NULL
+            }
+        }, .id = "comp")
+
+write.table(humdeg, file="../magma_genesets/glpko_deg.txt", sep = "\t", quote=F, row.names=F)
+
+# List of gene.raw files to process
+gene_files <- c(
+  "/projects/perslab/apps/MAGMA/out/Locke-UKBB2018/Locke-UKBB2018_UPDATED.genes.raw",
+  "/projects/perslab/apps/MAGMA/out/glucose_GCST90019508/glucose_GCST90019508.genes.raw",
+  "/projects/perslab/apps/MAGMA/out/glucose_GCST90271557/glucose_GCST90271557.genes.raw",
+  "/projects/perslab/apps/MAGMA/out/HbA1c_GCST007954/HbA1c_GCST007954.genes.raw",
+  "/projects/perslab/apps/MAGMA/out/NAFL_UKBB/NAFL_UKBB.genes.raw",
+  "/maps/projects/perslab/apps/MAGMA/out/2hGlu_TA_MAGIC/2hGlu_TA_MAGIC.genes.raw",
+  "/maps/projects/perslab/apps/MAGMA/out/HbA1c_TA_MAGIC/HbA1c_TA_MAGIC.genes.raw",
+  "/maps/projects/perslab/apps/MAGMA/out/fasting_insulin_TA_MAGIC/fasting_insulin_TA_MAGIC.genes.raw",
+  "/maps/projects/perslab/apps/MAGMA/out/fasting_glucose_TA_MAGIC/fasting_glucose_TA_MAGIC.genes.raw",
+  "/maps/projects/perslab/apps/MAGMA/out/BMR_GWASatlas3446/BMR_GWASatlas3446.genes.raw",
+  "/maps/projects/perslab/apps/MAGMA/out/BMI_GWASatlas3445/BMI_GWASatlas3445.genes.raw",
+  "/projects/perslab/apps/MAGMA/out/Weight_GWASatlas3440/Weight_GWASatlas3440.genes.raw",
+  "/projects/perslab/apps/MAGMA/out/ArmFatFreeMass_GWASatlas3462/ArmFatFreeMass_GWASatlas3462.genes.raw",
+  "/projects/perslab/apps/MAGMA/out/ArmFatPercentage_GWASatlas3460/ArmFatPercentage_GWASatlas3460.genes.raw",
+  "/projects/perslab/apps/MAGMA/out/ArmFatMass_GWASatlas3461/ArmFatMass_GWASatlas3461.genes.raw",
+  "/projects/perslab/apps/MAGMA/out/ArmImpedance_GWASatlas3450/ArmImpedance_GWASatlas3450.genes.raw",
+  "/projects/perslab/apps/MAGMA/out/BodyFatMass_GWASatlas3442/BodyFatMass_GWASatlas3442.genes.raw",
+  "/projects/perslab/apps/MAGMA/out/BodyFatPercentage_GWASatlas3441/BodyFatPercentage_GWASatlas3441.genes.raw",
+  "/projects/perslab/people/nvg559/glucose/magma_gsa/dat/Qiao_metaGLU.genes.raw",
+  "/projects/perslab/people/nvg559/glucose/magma_gsa/dat/Qiao_RG.genes.raw"
+  # Add more files as needed
+)
+
+# Common parameters
+set_annot_file <- "/projects/perslab/people/lhv464/magma_genesets/glpko_deg.txt"
+set_col <- "comp"
+gene_col <- "ENTREZID"
+covar_file <- "/projects/perslab/people/lhv464/glp1r_leptin/tissue_gex.cov.txt"
+# Loop through each gene file
+for (gene_file in gene_files) {
+  # Extract a base name for the output file
+  base_name <- basename(gene_file)
+  output_name <- sub("\\.genes\\.raw$", "_enrichment", base_name)
+  dir.create(here::here(paste0("gene_sets/glpko_deg/", output_name)))
+
+  # Construct the command
+  args <- c(
+    "--gene-results", gene_file,
+    "--set-annot", set_annot_file,
+    paste0("set-col=", set_col),
+    paste0("gene-col=", gene_col),
+    "--out", paste0(here::here(paste0("gene_sets/glpko_deg/", output_name),output_name))
+  )
+  
+  # Execute MAGMA command
+  result <- system2("magma", args = args)
+  
+  # Check the result
+  if (result == 0) {
+    cat("Successfully processed:", gene_file, "\n")
+  } else {
+    cat("Error processing:", gene_file, "\n")
+  }
+}
+```
+
+```{r}
+targets::tar_load(arc_glp1rko_labeled)
+targets::tar_load(pb_glp1rko)
+targets::tar_load(celltypes_glp1rko)
+names(pb_glp1rko) <- celltypes_glp1rko
+
+pbd <-  pb_glp1rko[["Agrp"]]
+design <- model.matrix(~0+group, data=pbd$samples %>% mutate(group = interaction(geno, diet)))
+colnames(design) <- gsub(":", "_", colnames(design))
+contrast.matrix <- makeContrasts(
+  d = groupmut.DIO - groupwt.DIO,
+  c = groupmut.Chow - groupwt.Chow,
+  d_d = (groupmut.DIO - groupmut.Chow) - (groupwt.DIO - groupwt.Chow),
+  stand = (groupwt.DIO - groupwt.Chow),
+  levels = design
+)
+
+# Fit the contrast
+fitd <- voomLmFit(pbd, design)
+fit2 <- contrasts.fit(fitd, contrast.matrix)
+fit2 <- eBayes(fit2, robust=F)
+degs <- topTable(fit2,n=Inf)
+
+
+gse_all <- purrr::map_dfr(colnames(contrast.matrix), function(x) {
+  degs <- topTable(fit2, coef=x, n=Inf)
+  stats <- degs$logFC*-log10(degs$adj.P.Val)
+  names(stats) <- degs$gene
+  gsefast <- fgsea(stats = stats, pathways=agrp_list)
+}, .id="contrast")
+
+gse_all  %>% select(contrast, pathway, padj, NES)  %>%
+  filter(contrast %in% c(1,2))  %>% 
+  ggplot() +
+  aes(y=pathway, x=NES, fill=contrast) +
+  geom_col(position=position_dodge(), aes(color=I(ifelse(padj<0.01, "black","white"))), linewidth=2) 
+dev.off()
+gse_all  %>% filter(grepl("fvc", pathway))
+topTable(fit2, coef="d", n=Inf)  %>%  mutate(stats = logFC*-log10(adj.P.Val))  %>%  arrange(stats)  %>% head
+
+
+hfd <- topTable(fit2, coef="d", n=Inf)  %>%  mutate(stats = logFC*-log10(adj.P.Val))  %>% select(gene, stats)  %>% deframe(.)
+plot_data_d <- plotEnrichment(agrp_list$`fvc.-1`, hfd)
+chow <- topTable(fit2, coef="stand", n=Inf)  %>%  mutate(stats = logFC*-log10(adj.P.Val))  %>% select(gene, stats)  %>% deframe(.)
+plot_data_c <- plotEnrichment(agrp_list$`fvc.-1`, chow)
+
+enrichment_score <- c(plot_data_d$data$ES,plot_data_c$data$ES)
+positions <- c(plot_data_d$data$rank,plot_data_c$data$rank)
+diet <- c(rep("dio",length(plot_data_d$data$rank)), rep("chow", length(plot_data_c$data$rank)))
+
+# Create the GSEA plot using ggplot2
+gsea_plot <- ggplot(data.frame(positions, enrichment_score,diet), aes(x = positions, y = enrichment_score)) +
+    geom_line(aes(color=diet)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(title = "test",
+         x = "Rank",
+         y = "Running Enrichment Score") +
+    theme_minimal()
+gsea_plot
+ggsave("a.pdf", h=2,w=5)
+```
+
+```{r}
+targets::tar_load(arc_glp1rko_labeled)
+agrp <-  subset(arc_diet_labeled, subset = seurat_clusters == "12")
+agrp <- process_seurat(agrp, method = "integrate", batch = "hash_pool", res = 0.2, dims = 10, return_model=T) 
+DimPlot(agrp, reduction="umap", group.by="treatment", c(1,2))
+dev.off()
+agrp_ko <- subset(arc_glp1rko_labeled, subset = predicted.celltype == "12")
+agrp_ko <- process_seurat(agrp_ko, method = "log",  res = 0.5, dims = 20) 
+agrp_ko <- project_umap(query = agrp_ko, ref = agrp, dims = 10, label_to_transfer="seurat_clusters", 
+             reference.assay = "integrated", query.assay = "RNA")
+DimPlot(agrp_ko, reduction="ref.pca", group.by="geno", split.by="diet", c(1,2))
+ggsave("a.pdf", h=3, w=5)
+```
+
+```{r}
+mat <- as.matrix(dist(rbind(agrp_ko@reductions$ref.pca@cell.embeddings[,1:10], agrp@reductions$pca@cell.embeddings[,1:10])))
+metadata <- bind_rows(agrp_ko[[]], agrp[[]])
+condition_A_indices <- which(metadata$geno == "mut" & metadata$diet=="Chow")
+condition_A_indices <- which(metadata$geno == "mut" & metadata$diet=="DIO")
+condition_A_indices <- which(metadata$geno == "wt" & metadata$diet=="DIO")
+condition_A_indices <- which(metadata$geno == "wt" & metadata$diet=="Chow")
+condition_A_indices <- which(metadata$treatment=="Fast")
+condition_B_indices <- which(metadata$treatment=="HFD")
+rowMeans(mat[condition_A_indices, condition_B_indices])  %>% mean
+ComplexHeatmap::Heatmap(mat, use_raster=T)
+dev.off()
+```
+```{r}
+targets::tar_load(arc_glp1rko_labeled)
+tar_load(arc_agrpko_labeled)
+tar_load(arc_diet_labeled)
+
+tar_load(agrpko_celldist)
+targets::tar_load(glp1rko_celldist)
+targets::tar_load(pb_agrpko)
+targets::tar_load(pb_glp1rko)
+targets::tar_load(celltypes_glp1rko)
+names(pb_glp1rko) <- celltypes_glp1rko
+glp1rko_celldist$results %>% arrange(Dist.)
+```
+
+```{r}
+alldeg <- alldeg  %>% filter(abs(logFC)>1) %>% mutate(group = paste0(sign(logFC),"_", comp))
+featlist <- split(alldeg$gene, f = alldeg$group)
+featlist[[2]]
+library(Seurat)
+agrp_ko <- subset(arc_glp1rko_labeled, subset = predicted.celltype == "Agrp")
+DefaultAssay(agrp_ko) <- "RNA"
+agrp_ko <- AddModuleScore(agrp_ko, features=featlist)
+VlnPlot(agrp_ko, group.by="geno", split.by="diet", c("Cluster1","Cluster2","Cluster3","Cluster4"))
+emm <- agrp_ko[[]] %>% 
+  dplyr::select(starts_with("Cluster"), hash.mcl.ID, diet, geno)  %>% 
+  pivot_longer(starts_with("Cluster"))  %>% 
+  group_by(hash.mcl.ID, diet, geno, name)  %>% 
+  summarise(mean = mean(value))  %>% 
+  lm(mean~name*diet*geno, data=.)  %>% 
+  emmeans::emmeans(.,~diet*geno|name) 
+
+contrast_matrix <- rbind(
+  "Difference of differences" = c(1, -1, -1, 1) # (Diet1_Geno1 - Diet1_Geno2) - (Diet2_Geno1 - Diet2_Geno2)
+)
+
+# Step 5: Applying the contrast to the EMMs
+contrast_results <- contrast(emm, interaction = list(diet = c(1, -1), geno = c(1, -1)))
+
+# Print the results
+summary(contrast_results)
+
+dev.off()
+```
+
+```{r}
+contrasts <- makeContrasts(
+    dietChow_genomut_vs_dietDIO_genomut = dietChow_genomut - dietDIO_genomut,
+    dietChow_genomut_vs_dietChow_genowt = dietChow_genomut - dietChow_genowt,
+    dietChow_genomut_vs_dietDIO_genowt = dietChow_genomut - dietDIO_genowt,
+    dietDIO_genomut_vs_dietChow_genowt = dietDIO_genomut - dietChow_genowt,
+    dietDIO_genomut_vs_dietDIO_genowt = dietDIO_genomut - dietDIO_genowt,
+    dietChow_genowt_vs_dietDIO_genowt = dietDIO_genowt - dietChow_genowt,
+    int = (dietDIO_genomut - dietChow_genomut) - (dietDIO_genowt - dietChow_genowt),
+    levels = colnames(design))
+```
+
+```{r}
+# identify genes that pass expression cutoff
+isexpr <- rowSums(cpm(pb_glp1rko$`9`) > 1) >= 0.5 * ncol(pb_glp1rko$`9`)
+table(isexpr)
+
+# create data structure with only expressed genes
+gExpr <- DGEList(counts = pb_glp1rko$`9`$counts[isexpr, ])
+
+# Perform TMM normalization
+gExpr <- calcNormFactors(gExpr)
+
+# Specify variables to be included in the voom() estimates of
+# uncertainty.
+# Recommend including variables with a small number of categories
+# that explain a substantial amount of variation
+design <- model.matrix(~diet*geno, pb_glp1rko$`9`$sample)
+
+# Estimate precision weights for each gene and sample
+# This models uncertainty in expression measurements
+vobjGenes <- voom(gExpr, design)
+
+# Define formula
+form <- ~ (1 | diet) + (1 | geno) + (1 | diet:geno)
+
+# variancePartition seamlessly deals with the result of voom()
+# by default, it seamlessly models the precision weights
+# This can be turned off with useWeights=FALSE
+varPart <- fitExtractVarPartModel(vobjGenes, form, pb_glp1rko$`9`$sample)
+```
+
+```{r}
+library(variancePartition)
+pbd <- pb_glp1rko[["Agrp"]]
+logcpm <- edgeR::cpm(pbd, log=T, prior.count=5)
+
+# Specify variables to be included in the voom() estimates of
+# uncertainty.
+# Recommend including variables with a small number of categories
+# that explain a substantial amount of variation
+
+# Estimate precision weights for each gene and sample
+# This models uncertainty in expression measurements
+vobjGenes <- voom(pbd, design)
+form <- ~ (1 | diet) + (1 | geno) + (1 | diet:geno)
+mod <- lme4::lmer(form, data = pbd$sample) 
+calcVarPart(mod)
+
+# fit model
+vpInteraction <- fitExtractVarPartModel(logcpm, form, pbd$sample, useWeights=F)
+# sort variables (i.e. columns) by median fraction
+#       of variance explained
+head(vpInteraction[order(vpInteraction$`diet:geno`, decreasing = TRUE), ], n=20)
+# Figure 1a
+# Bar plot of variance fractions for the first 10 genes
+plotPercentBars(vp[1:10, ])
+dev.off()
+
+# get gene with the highest variation across Tissues
+# create data.frame with expression of gene i and Tissue
+#       type for each sample
+GE <- data.frame(Expression = vobjGenes$E["Tenm2", ], Tissue = paste0(pbd$sample$diet, pbd$sample$geno))
+
+# Figure 2a
+# plot expression stratified by Tissue
+plotStratify(Expression ~ Tissue, GE)
+dev.off()
+```
+
+```{r}
+pbd$counts["Vgf",]  %>%  enframe()  %>% 
+  mutate(diet = pbd$sample$diet, geno = pbd$sample$geno)  %>% 
+  ggplot() +
+  aes(diet, value, fill=geno) +
+  geom_boxplot()
+ggsave("a.pdf")
+```
+
+```{r}
+norm <- edgeR::cpm(pbd,log=T)
+out <- nmf(norm,k=15, L1=c(0.9, 0.1))
+out@h %>% data.frame() %>% 
+  rownames_to_column("clus")  %>% 
+  pivot_longer(-clus)  %>% 
+  inner_join(pbd$sample %>% mutate(name = colnames(pbd)))  %>% 
+  #lm(value~diet*geno*clus, data=.)  %>% emmeans::emmeans(., pairwise~diet|geno*clus)  %$% contrasts  %>% data.frame()
+  ggplot() +
+  aes(x=clus, y=value, fill=interaction(geno, diet)) +
+  geom_boxplot() +
+  facet_wrap(~clus, scales="free")
+ggsave("a.pdf", h=4, w=10)
+head(out@w %>% data.frame()  %>% arrange(-nmf3))
+```
+
+```{r}
+
+
+gsefast
+dim(degs)
+sort(stats) %>% tail
+# Define a function to perform enrichment analysis for each comparison group
+enrichment_test <- function(df, gene_vector, comp) {
+  # Subset the dataframe for the given comparison group
+  comp_genes <- alldeg %>% filter(comp == "hvc", logFC>0) %>% pull(gene)
+  
+  # Create a contingency table
+  m <- length(comp_genes)  # number of genes in the comparison group
+  n <- 11000  # number of genes not in the comparison group
+  k <- length(intersect(comp_genes, degs$gene[degs$logFC<0]))  # number of genes in the comparison group and in the gene vector
+  N <- length(degs$gene)  # total number of genes in the gene vector
+
+  # Perform hypergeometric test
+  p_value <- phyper(k - 1, m, n, N, lower.tail = FALSE)
+  
+  (p_value)
+}
+
+# Apply the enrichmen
+
+scores <- filtdeg$d*-log10(filtdeg$P.Value)
+names(scores) <- filtdeg$gene
+scores <- sort(scores, decreasing=T)
+head(scores)
+library(clusterProfiler)
+ego <- enrichGO(degs$gene[degs$logFC>0],  
+                keyType       = 'SYMBOL',
+                minGSSize=10,
+                universe = rownames(pbd),
+                OrgDb         = org.Mm.eg.db,
+                ont           = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.05)
+filtdeg %>% ggplot() + aes(d,c) + geom_point()
+dev.off()
+logcpm <- edgeR::cpm(pbd, prior.count=5, log=T)
+logcpm <- t(scale(t(logcpm[rownames(logcpm) %in% rownames(filtdeg),])))
+library(ComplexHeatmap)
+ha = HeatmapAnnotation(d = pbd$samples$geno,  e = pbd$samples$diet,
+        simple_anno_size = unit(0.3, "cm"),annotation_name_gp= gpar(fontsize = 8))
+ra = rowAnnotation(foo = anno_mark(at = idx, labels = tolabel))
+
+pdf("glp1r.pdf", h=4, w=5)
+hmap <- Heatmap(logcpm, show_row_dend=T, 
+                   show_row_names = F,
+     top_annotation = ha, km=4,
+                    show_column_names=F, row_names_gp = gpar(fontsize = 2),
+                    cluster_columns=T)
+ht <- draw(hmap)
+dev.off()
+degs <- rownames(logcpm)[row_order(ht)[[4]]] %>% sort(.)
+
+# 1. Filtering
+keep <- filterByExpr(dge)
+dge <- dge[keep, , keep.lib.sizes=FALSE]
+# 2. Normalization
+dge <- calcNormFactors(dge)
+# 3. Create design matrix
+design <- model.matrix(~group, data=dge$samples)
+
+
+pbd <- pb_glp1rko[["Agrp"]][,pbd$sample$hash_pool!="H2303"]
+logcpm <- edgeR::cpm(pbd, log=T, prior.count=5)
+logcpm <- logcpm[,pbd$sample$hash_pool!="H2303"]
+meta <- pbd$sample[pbd$sample$hash_pool!="H2303",]
+pca <- prcomp(t(logcpm))
+pca$x %>%
+    data.frame()  %>% 
+    bind_cols(meta)  %>% 
+    ggplot() +
+    aes(PC2,PC3, color=diet, shape=geno) +
+    geom_point()
+dev.off()
+
+logcpm[c("Vgf","Shc3"),]  %>% t()  %>% 
+  data.frame()  %>% 
+  mutate(geno = pbd$sample$geno, diet=pbd$sample$diet)  %>% 
+  pivot_longer(c(-geno,-diet))  %>% 
+  ggplot() +
+  aes(x=name, value, fill=interaction(geno,diet)) +
+  geom_boxplot() 
+dev.off()
+pca$rotation[order(-pca$rotation[,2]),] %>% head
+
+contrast.matrix <- makeContrasts(
+  d_c = (groupmut.DIO-groupmut.Chow) - (groupwt.DIO-groupwt.Chow),
+  levels = design
+)
+
+# Fit the contrast
+fit2 <- contrasts.fit(fitd, contrast.matrix)
+fit2 <- eBayes(fit2, robust=T)
+interaction_results <- topTable(fit2, number=Inf, p=0.05)
+dim(interaction_results)
+interaction_results %>% head
+# Assuming your top gene is named "GeneX"
+pbd <- pb_alldiet[["Agrp"]]
+gene_data <- data.frame(
+  Expression = edgeR::cpm(pbd,log=T)["Shc3",],
+  Genotype = pbd$samples$geno,
+  Diet = pbd$samples$treatment
+)
+
+ggplot(gene_data, aes(x=Diet, y=Expression, fill=Genotype)) + geom_boxplot()
+ggsave("a.pdf", h=3,w=3)
+  geom_point() +
+  theme_minimal() +
+  ggtitle("Interaction Plot for GeneX") +
+  geom_abline()
+
+dev.off()
+design <-  model.matrix(~geno+diet, data=pbd$samples)
+colnames(design) <- gsub(":", "_", colnames(design))
+fitd <- voomLmFit(pbd, design)
+fitd <- eBayes(fitd)
+topTable(fitd, coef="genowt", n=Inf, p=0.05) %>% head
+
+fit2 <- contrasts.fit(fitd, c(0,0,-1,1))
+fit2 <- eBayes(fit2)
+topTable(fit2, n=Inf)   %>% filter(gene=="Vgf")
+
+# Apply the contrast matrix to the fitted model
+fitd2 <- contrasts.fit(fitd, contrasts)
+# Compute the statistics for the contrasts
+fitd2 <- eBayes(fitd2)
+colnames(design)
+fastdeg <- topTable(fitd2, coef = "dietChow_genomut_vs_dietChow_genowt", n=Inf)   
+diodeg <- topTable(fitd, coef=2, n=Inf, sort="p", p=0.05)
+diodeg  %>% filter(gene=="Sez6l")
+diodeg  %>% inner_join(diodegko, by="gene") %>% ggplot() + aes(logFC.x, logFC.y) + geom_point()# summarise(cor = cor(logFC.x,logFC.y))#filter(grepl("Gab",gene))
+ggsave("a.pdf")
+colnames(design)
+```
+```{r}
+mutdeg <- topTable(fitd2, coef = "int", p=0.05, n=Inf)   
+wtdeg <- topTable(fitd2, coef = "dietChow_genomut_vs_dietChow_genowt",   p=0.05, n=Inf)   
+wtdeg  %>% filter(grepl("Nos", gene))
+dim(mutdeg)
+mutdeg  %>% 
+  inner_join(wtdeg, by="gene")    %>% filter(adj.P.Val.x<0.05|adj.P.Val.y<0.05)  %>% 
+  ggplot()+aes(logFC.x, logFC.y) + geom_point() + geom_abline() + ggrepel::geom_text_repel(aes(label=gene))
+ggsave("a.pdf")
+fastdeg  %>% filter(adj.P.Val<0.05)  %>% head()
+```
+
+```{r}
+gko <- pb_glp1rko$`9`
+
+design <- model.matrix(as.formula(~ 0 + diet:geno), data = gko$samples)
+colnames(design) <- gsub("/","_",colnames(design))
+colnames(design) <- gsub(":","_",colnames(design))
+
+y <- estimateGLMRobustDisp(gko, design)
+fit <- glmFit(y, design)
+colnames(fit)
+my.contrasts <- makeContrasts(cont = (dietDIO_genowt - dietDIO_genomut) - (dietChow_genowt - dietChow_genomut),dio = (dietDIO_genomut - dietDIO_genowt), chow = (dietChow_genomut - dietChow_genowt), levels = design)
+topTags(glmLRT(fit, contrast=my.contrasts), n=Inf) %>% data.frame()  %>% filter(logCPM>3, FDR<0.05) %>% ggplot() + aes(logFC.chow, logFC.dio) + geom_point() + ggrepel::geom_text_repel(aes(label=gene)) + geom_abline()
+ggsave("a.pdf")
+```
+
+```{r}
+res_mut %>% janitor::clean_names()  %>%  head(n=50)
+dds_glp1rko <- create_dds(pb_glp1rko[["0"]], design = "~ geno + seq_pool")
+vsd_glp1rko <- create_vsd(dds_glp1rko, batch1=NULL, batch2=NULL)
+pdf("a.pdf")
+
+gene_set <- c("Tenm1", "Ryr2", "Il1rapl1", "Epha5", "Socs3","Ptpn1")
+names(gene_set) <- gene_set
+
+df <- map_dfr(gene_set, function(x) {
+    y <- plotCounts(dds_glp1rko, x, c("geno", "diet"), returnData=TRUE)
+    y$feature <- x
+    return(y)
+}, .id="ct")
+
+df %>% mutate(diet = ifelse(diet=="DIO", "HFD","NCD"))  %>% 
+  ggplot() +aes(x=fct_relevel(geno, c("wt","mut")), y=count, fill=diet) + geom_boxplot() + facet_wrap(~feature, scales="free_y", ncol=2) + theme_bw() + labs(x=NULL)
+ggsave("a.pdf", h=6, w=6)
+```
+
+```{r}
+gtb_diet <- subset(arc_diet_labeled, subset = predicted.celltype == "9")
+gtb_diet <- process_seurat(gtb_diet, method = "log", cluster=F, nfeats=5000)
+fac <- nmf(t(gtb_diet@assays$RNA@data[VariableFeatures(gtb_diet),]), k=12)
+fac@w  %>% data.frame()  %>% mutate(group = gtb_diet$treatment)  %>% 
+  pivot_longer(-group)  %>%  nest(-name)  %>% 
+  mutate(mod = purrr::map(data, ~lm(value~group, data= .x)  %>%  broom::tidy(.)))  %>% unnest(mod)  %>% arrange(p.value)  %>% filter(!grepl("Int", term))
+```
+
+```{r}
+fac@w  %>% data.frame()  %>% mutate(group = gtb_diet$treatment)    %>% pivot_longer(-group)  %>% ggplot() + aes(group, value) + geom_boxplot() + facet_wrap(~name, scales="free_y")
+ggsave("a.pdf")
+
+scores <- t(fac@h)
+head(scores[order(-scores[,2]),1:3], n=20)
+```
+
+```{r}
+gtb <- subset(arc_glp1rko_labeled, subset = predicted.celltype == "9")
+gtb <- process_seurat(gtb, method = "log", cluster=F)
+as.vector(prod(fac)[1:10,1:10])
+gtb[["geno"]] <- factor(gtb$geno, levels = c("wt","mut"))
+DimPlot(gtb, reduction="pca", group.by="treatment", split.by="geno") + theme_bw()
+ggsave(paste0(fig_path_4, "gtb_pca.pdf"), h=3, w=5)
+```
+
+```{r}
+agrp <- subset(arc_agrpko_labeled, subset = predicted.celltype == "0")
+agrp <- process_seurat(agrp, method = "log", dims=10, res=0.1)
+agrp[["geno"]] <- factor(agrp$geno, levels = c("wt","mut"))
+DimPlot(agrp, reduction="pca", group.by="treatment", split.by="geno") + theme_bw()
+ggsave(paste0(fig_path_4, "agrp_pca.pdf"), h=3, w=5)
+```
+
+```{r}
+dat <- glp1rko_celldist$results %>% janitor::clean_names() %>% rownames_to_column("group") %>% 
+    separate(group, into = c("clus","diet")) 
+
+library(ggh4x)
+dat  %>% 
+  group_by(clus)  %>% 
+  filter(clus!=12)  %>% 
+  mutate(max = max(dist))  %>% 
+  ggplot() +
+  aes(x=diet, y=dist, group=clus, color=I(ifelse(p.adjust(p_val)<0.05,"red", "grey80"))) +
+  geom_pointpath() +
+  geom_text(data=subset(dat, diet=="DIO" & clus!=12), aes(label=clus, x=2.05), hjust=0, size=2) +
+  cowplot::theme_half_open()
+
+ggsave("a.pdf", h=3,w=3)
+
+dio_df <- dat %>% filter(diet == 'DIO') %>% dplyr::select(clus, dist, x95_percent_ci_low, x95_percent_ci_upper, padj)
+chow_df <- dat %>% filter(diet == 'Chow') %>% dplyr::select(clus, dist, x95_percent_ci_low, x95_percent_ci_upper, padj)
+
+# Merging on clus
+merged_df <- merge(dio_df, chow_df, by="clus", suffixes = c("_dio", "_chow"))
+
+
+# Plotting
+p <- merged_df  %>% 
+  ggplot(., aes(dist_dio, dist_chow, color=I(case_when(padj_dio<0.05&padj_chow<0.05 ~ "red",
+                                                     padj_dio<0.05&padj_chow>0.05 ~ "black",
+                                                     T ~ "grey80")))) +
+  #geom_errorbar(aes(xmin=x95_percent_ci_low, xmax=x95_percent_ci_upper), width=0, position=position_dodge(width=0.25)) +
+  geom_point(size=3, position=position_dodge(width=0.25)) +
+  theme_classic() +
+  #theme(axis.text.y=element_blank(), axis.ticks.y=element_blank()) +
+  #facet_wrap(~fct_reorder(clus, -dist), scales="free_y", ncol=1, strip.position="left") +
+  labs(y=NULL, color=NULL) +
+  geom_abline(lty=2) +
+  ggbreak::scale_x_break(c(15, 30)) +
+  ggrepel::geom_text_repel(aes(label=clus))
+
+p
+
+# Plotting
+p <- merged_df  %>% 
+  group_by(clus)  %>% 
+  mutate(max = max(dist))  %>% 
+  arrange(-max)   %>% 
+  ungroup()  %>% 
+  dplyr::slice(1:30)  %>% 
+  ggplot(., aes(y=fct_reorder(clus, dist), x=dist, color=diet)) +
+  geom_errorbar(aes(xmin=x95_percent_ci_low, xmax=x95_percent_ci_upper), width=0, position=position_dodge(width=0.25)) +
+  geom_point(size=3, position=position_dodge(width=0.25)) +
+  theme_classic() +
+  theme(axis.text.y=element_blank(), axis.ticks.y=element_blank()) +
+  facet_wrap(~fct_reorder(clus, -dist), scales="free_y", ncol=1, strip.position="left") +
+  labs(y=NULL, color=NULL)
+
+p
+
+ggsave("a.pdf", h=4, w=4, plot = print(p+coord_equal() + coord_flip()))
+```
+
+```{r}
+y <- pb_glp1rko[["9"]]
+y$samples$fac <- interaction(y$samples$geno, y$samples$diet)
+design <- model.matrix(as.formula(~0+fac), data = y$samples)
+colnames(design) <- gsub("/","_",colnames(design))
+y <- estimateGLMRobustDisp(y, design)
+fit <- glmFit(y, design)
+
+pdf("a.pdf")
+plotPCA(vsd_glp1rko[,vsd_glp1rko$diet=="Chow"], intgroup=c("geno","diet"))
+dev.off()
+
+contrast <- makeContrasts((facmut.DIO - facwt.DIO), levels = colnames(design))
+res_mut <- topTags(glmLRT(fit, contrast=contrast[,1]), n=Inf)  %>%  data.frame()  %>%  janitor::clean_names()
+res_both <- topTags(glmLRT(fit, contrast=contrast), n=Inf)  %>%  data.frame()
+
+df <- enframe(res_mut$gene[res_mut$fdr<0.05&res_mut$log_fc>0], value="SYMBOL")
+
+df <- inner_join(df, AnnotationDbi::select(org.Mm.eg.db, keys = df$SYMBOL,  columns="ENTREZID", keytype = "SYMBOL"))
+goterms <- enrichKEGG(df$ENTREZID,org="mmu",
+        minGSSize = 10, maxGSSize = 500, qvalue=5e-2)
+
+goterms@result  %>% head(10)  %>% mutate(desc = gsub("-.*","",Description))  %>%   ggplot() + aes(x=-log10(qvalue),y=desc) + geom_col() + labs(y=NULL) + theme_bw()
+
+formula_res <- compareCluster(ENTREZID~value, data= df, fun="enrichGO", OrgDb = org.Mm.eg.db, ont="ALL",
+        minGSSize = 10, maxGSSize = 500, qvalue=5e-2,
+        universe = AnnotationDbi::select(org.Mm.eg.db, keys = res_treatment_lepip[[ct]]$gene,  columns="ENTREZID", keytype = "SYMBOL"))
+
+res_mut %>% janitor::clean_names()  %>% filter(fdr<0.05)  %>%
+  ggplot() +
+  aes(log_fc, -log10(fdr)) +
+  geom_point() + ggrepel::geom_text_repel(aes(label=gene)) + lims(y=c(0,15)) + theme_bw()
+ggsave("a.pdf", h=3, w=7)
+agrp <- subset(arc_glp1rko_labeled, subset = predicted.celltype == "0")
+agrp <- subset(agrp, subset = diet == "DIO")
+agrp <- process_seurat(agrp, cluster=F, method="log")
+DimPlot(agrp, group.by="geno", reduction="pca", c(1,5)) + ggtitle(NULL) 
+agrp@reductions$pca@feature.loadings[,5]  %>% sort(.)  %>%  tail(50)
+ggsave("a.pdf", h=6,w=6)
+```
+
+```{r}
+DimPlot(arc_glp1rko_labeled, raster=T, label=T, reduction="ref.umap") + NoLegend()
+ggsave("a.pdf")
+```
+
+```{r}
+mod9 <- names(km$cluster)[km$cluster==9]
+mod10 <- names(km$cluster)[km$cluster==10]
+
+gtb <- AddModuleScore(gtb, features = list("clus9"= mod9, "clus10"=mod10))
+gtb[[]] %>%
+  dplyr::select(geno, treatment, Cluster1, Cluster2)  %>% 
+  pivot_longer(starts_with("Clus"))  %>% filter(gene=="Junb")
+  ggplot() +
+  aes(name, value, fill=interaction(treatment, geno)) +
+  geom_violin(width=0.75) +
+  theme_bw() +
+  facet_wrap(~name, scales="free_x") +
+  labs(x=NULL, y=NULL, fill=NULL)
+ggsave(paste0(fig_path_4, "module_changes.pdf"), h=2, w=4)
+```
+
+```{r}
+tar_load(fit_glp1rko)
+tar_load(fit_diet)
+
+dds_glp1rko <- purrr::map(fit_glp1rko, function(x) {
+    rownames(x$samples) <- colnames(x$counts)
+    dds <- DESeqDataSetFromMatrix(countData = x$counts, colData = x$samples, 
+                            design = ~ geno + diet)
+    return(dds)
+})
+
+dds_diet <- purrr::map(fit_diet, function(x) {
+    rownames(x$samples) <- colnames(x$counts)
+    dds <- DESeqDataSetFromMatrix(countData = x$counts, colData = x$samples, 
+                            design = ~ treatment + hash_pool)
+    return(dds)
+})
+
+vsd_diet <- purrr::map(dds_diet, function(x) {
+    vsd <- vst(x, blind=F)
+    assay(vsd) <- limma::removeBatchEffect(assay(vsd), batch = vsd$hash_pool, 
+                   design = model.matrix(~treatment, data = colData(vsd)))
+    return(vsd)
+})
+
+vsd_glp1rko <- purrr::map(dds_glp1rko, function(x) {
+    vsd <- vst(x, blind=F)
+    return(vsd)
+})
+
+names <- purrr::map(vsd_diet, ~unique(.x$predicted.celltype))
+names(vsd_diet) <- names
+
+names <- purrr::map(vsd_glp1rko, ~unique(.x$predicted.celltype))
+names(vsd_glp1rko) <- names
+```
+
+```{r}
+df <- data.frame(pca$x, condition = vsd_diet[[ct]]$treatment, geno = "wt", dataset = "diet")  %>%  
+  pivot_longer(starts_with("PC"))  %>% 
+  group_by(condition, name, dataset, geno)  %>% 
+  summarise(mean = mean(value))
+
+
+# Combine original and new PCA data for visualization
+combined_pcaData <- rbind(
+  data.frame(pca$x, condition = vsd_diet[[ct]]$treatment, geno = "wt", dataset = "diet"),
+  data.frame(new_data_transformed, condition = vsd_glp1rko[[ct]]$diet, geno = vsd_glp1rko[[ct]]$geno, dataset="glp1rko")
+)
+
+pca_scores <- combined_pcaData[,c("PC1")]
+# Calculate Mahalanobis distance matrix
+distance_matrix <- dist(pca_scores)
+distance_matrix <- data.frame(as.matrix(distance_matrix))
+
+colnames(distance_matrix) <- paste0(combined_pcaData$condition, combined_pcaData$dataset, combined_pcaData$geno)
+rownames(distance_matrix) <- paste0(combined_pcaData$condition, combined_pcaData$dataset, combined_pcaData$geno, 1:nrow(distance_matrix))
+
+distance_matrix  %>%  data.frame()  %>% 
+  rownames_to_column("sample")  %>% 
+  pivot_longer(-sample)  %>% 
+  filter(!grepl("glp1r",sample)) %>% 
+  mutate(group = ifelse(grepl("DIO", name), "DIO", "chow"),
+         geno = ifelse(grepl("mut", name), "mut", "wt"))  %>% 
+  ggplot() +
+  aes(x=sample, y= value, fill = interaction(group,geno)) +
+  geom_boxplot()
+ggsave("a.pdf")
+print(distance_matrix)
+
+
+
+ctrl_data <- data.frame(pcaData, condition = vsd_diet[["9"]]$treatment, geno = "wt", dataset = "diet")
+ctrl_data  %>% group_by
+
+
+ggplot(data.frame(pca$x, trt = vsd_diet[[ct]]$treatment[vsd_diet[[ct]]$treatment %in% c("HFD","Chow")]), aes(PC1, PC2, color=trt)) +
+  geom_point() 
+
+ggsave("a.pdf")
+```
+
+```{r}
+ct <- "0"
+DefaultAssay(arc_diet_labeled) <- "RNA"
+ref <- subset(arc_diet_labeled, subset = predicted.celltype == ct)
+ref <- subset(ref, subset = treatment %in% c("HFD", "Chow"))
+ref <- process_seurat(ref, method = "integrate", batch = "hash_pool", cluster=F)
+DimPlot(ref, reduction="pca", group.by="treatment", c(1,2))
+refpca <- prcomp(t(ref@assays$integrated@scale.data), scale.=F)
+ggplot(refpca$x) + aes(PC1, PC2, color=ref$treatment) + geom_point()
+ggsave("a.pdf")
+vsd_glp <- assay(vsd_diet[[ct]][,vsd_diet[[ct]]$treatment %in% c("HFD","Chow")])
+gene_variances <- apply(vsd_glp, 1, var)
+ 
+#Select the top 2999 most variable genes (or all if fewer than 2999 common genes)
+num_top_genes <- min(2000, length(gene_variances))
+top_genes <- order(gene_variances, decreasing = TRUE)[1:num_top_genes]
+vsd_glp <- vsd_glp[top_genes,]
+pca <- prcomp(t(vsd_glp))
+head(refpca$rotation[order(pca$rotation[,3]),])
+ggsave("a.pdf")
+
+
+gtb <- subset(arc_agrpko_labeled, subset = predicted.celltype == ct)
+gtb <- process_seurat(gtb, method = "log", cluster=F)
+DimPlot(gtb, reduction="pca", group.by="diet", split.by="geno")
+ggsave("a.pdf")
+df <- predict(refpca, t(gtb@assays$RNA@data))  %>% 
+  data.frame()  %>% 
+  mutate(diet = gtb$diet,
+         geno = gtb$geno)
+
+ggplot(df) + aes(PC1, PC2, color =diet) + geom_point() + facet_wrap(~geno)
+ggsave("a.pdf")
+
+pred <- prediction(df$PC1[df$geno == "wt"], df$diet[df$geno == "wt"])
+perf <- performance(pred, measure="auc")
+perf@y.values[[1]]
+
+pred <- prediction(df$PC1[df$geno == "mut"], df$diet[df$geno == "mut"])
+perf <- performance(pred, measure="auc")
+perf@y.values[[1]]
+```
