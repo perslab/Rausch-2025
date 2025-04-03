@@ -1,0 +1,117 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(DESeq2)
+library(tidyverse)
+
+countmat <- read.csv("~/Downloads/GSE162603_counts.csv.gz") %>%  filter(!duplicated(gene_name))
+cts <- countmat[,c(3:ncol(countmat))]
+rownames(cts) <- countmat$gene_name
+
+meta <- read.csv("~/Downloads/GSE162603_metadata.csv.gz")
+rownames(meta) <- colnames(cts)
+meta$group <- ifelse(grepl("Leptin", meta$Treatment), "leptin", "fasted")
+meta$time <- ifelse(grepl("10", meta$Treatment), "10", "3")
+meta$animal <-  substr(meta$Description, start = 1, stop = 2)
+dds <- DESeqDataSetFromMatrix(countData = cts[,meta$Cells=="Bead"], 
+                              colData = meta[meta$Cells=="Bead",],
+                              design = ~group+time)
+
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds <- dds[keep,]
+dds <- DESeq(dds, test="LRT", reduced = ~time)
+vsd_trap <- vst(dds, blind=F)
+results(dds) %>%  data.frame() %>% arrange(padj) %>%  filter(log2FoldChange>0) %>% rownames_to_column("gene") %>% filter(gene=="Khdrbs3")
+```
+
+```{r}
+load("/Users/lhv464/Downloads/dea-rna/data.Robject")
+dds_agrp <- DESeqDataSetFromMatrix(countData = data_edger$counts[,data_edger$samples$group!="fed"], 
+                              colData = data_edger$samples[data_edger$samples$group!="fed",],
+                              design = ~group)
+
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds_agrp) >= 10) >= smallestGroupSize
+dds_agrp <- dds_agrp[keep,]
+dds_agrp <- DESeq(dds_agrp)
+resultsNames(dds_agrp)
+results(dds_agrp) %>%  data.frame() %>% rownames_to_column("gene") %>% filter(gene=="Khdrbs3")
+vsd_agrp <- vst(dds_agrp, blind=F)
+```
+```{r}
+load("/Users/lhv464/Downloads/dea-rna-ffl-pomc/data.Robject")
+dds_pomc <- DESeqDataSetFromMatrix(countData = data_edger$counts[,data_edger$samples$group!="fed"], 
+                              colData = data_edger$samples[data_edger$samples$group!="fed",],
+                              design = ~group)
+
+smallestGroupSize <- 2
+keep <- rowSums(counts(dds_pomc) >= 10) >= smallestGroupSize
+dds_pomc <- dds_pomc[keep,]
+dds_pomc <- DESeq(dds_pomc)
+results(dds_pomc) %>% data.frame() %>%  filter(padj<0.05)
+vsd_pomc <- vst(dds_pomc, blind=F)
+```
+
+```{r}
+ahituv_data <- readxl::read_excel("Downloads/GSE112125_All_genes.Leptin_RNA.xlsx")
+vsd_ahit <- ahituv_data %>% dplyr::select(c(ends_with("Gene"),contains("stabilized"))) %>% 
+  filter(!duplicated(Gene)) %>% 
+  column_to_rownames("Gene") %>% 
+  dplyr::select(contains("GFPp"))
+meta_ahit <- ifelse(grepl("L", colnames(vsd_ahit)), "leptin","fasted")
+```
+
+
+```{r}
+library(mixOmics)
+X <- merge(assay(vsd_trap)  %>% data.frame() %>% rownames_to_column("gene"),
+      assay(vsd_agrp)  %>% data.frame() %>% rownames_to_column("gene"), by="gene") %>% 
+    merge(., vsd_ahit %>% rownames_to_column("gene"), by="gene") %>%  
+  column_to_rownames("gene")
+
+y <- c(colData(vsd_trap)$group, colData(vsd_agrp)$group, factor(meta_ahit))
+study <- c( rep("trap", 14), rep("agrp", 8), rep("ahit", 12))
+
+
+# generate basic MINT pls-da model
+basic.splsda.model <- mint.splsda(t(X), y, study = study, ncomp = 2, keepX = 100, near.zero.var = T, scale=F)
+# plot the samples
+plotIndiv(basic.splsda.model, legend = TRUE, 
+          title = '', subtitle = 'Leptin Treatment', ellipse = TRUE) 
+ggsave("glp1r_leptin/lgs_splsda.pdf",h=3,w=6)
+```
+
+```{r}
+library(clusterProfiler)
+library(org.Mm.eg.db)
+
+selectVar(basic.splsda.model)$value %>% rownames_to_column("gene") %>% 
+  write_csv("glp1r_leptin/lgs_genes.csv")
+  
+selectVar(basic.splsda.model)$value %>% rownames_to_column("gene") %>% 
+  dplyr::slice_max(n=25, order_by=abs(value.var)) %>% 
+  ggplot() +
+  aes(x=fct_reorder(gene,value.var), y=value.var) +
+  geom_col() +
+  labs(y="Model Weight", x=NULL) + cowplot::theme_cowplot() + theme(axis.text.x=element_text(angle=45, hjust=1))
+
+ggsave("glp1r_leptin/lgs_barplot.pdf",h=3,w=5)
+
+markers <- rownames(selectVar(basic.splsda.model)$value)[selectVar(basic.splsda.model)$value<0] %>% print()
+go_lgs <- enrichGO(markers, OrgDb = "org.Mm.eg.db", ont="ALL", keyType = "SYMBOL", universe = rownames(X))
+go_lgs_simple <- simplify(go_lgs, cutoff=0.5, by="p.adjust", select_fun=min)
+barplot(go_lgs_simple, show=5) + theme(axis.text.y=element_text(size=6))
+ggsave("glp1r_leptin/lgs_go.pdf",h=4,w=5)
+```
+
+```{r}
+go_lgs_simple@result %>% write_csv("goterm_enrich_lgs.csv")
+```
+
+
+
+
