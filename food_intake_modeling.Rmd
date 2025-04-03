@@ -1,0 +1,898 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(tidyplots)
+
+# create a dataframe with sample IDs and their group labels
+sample_groups_df <- data.frame(
+  SampleID = c(
+    "Q0944", "Q0946", "Q0948", "R0084", "R0085", "R0086", "R0089", "R0090", "R0093",
+    "Q0941", "Q0942", "Q0943", "Q0945", "Q0949", "Q0950", "R0087", "R0088", "R0091", "R0092"
+  ),
+  Group = c(
+    rep("Glp1R_LepR_KO", 9),
+    rep("Control", 10)
+  )
+)
+
+cols <- c("#EBB395","#97BCDA")
+```
+```{r}
+library(ggplot2)
+library(tidyverse)
+library(emmeans)
+
+dread_data <- readxl::read_xlsx("~/Downloads/testing.xlsx", sheet=3) %>% filter(Time!=0)
+
+dread_data %>% filter(Exp == "Ghrelin") %>%
+  pivot_longer(starts_with("FEN")) %>%
+  mutate(value = log1p(value)) %>%
+  lme4::lmer(value ~ Trt*(Time) + (1|name), data=.) %>%
+  car::Anova(.)
+  emmeans::emmeans(., pairwise~Trt|Time)
+
+dread_data %>% filter(Exp == "DarkCycle") %>%
+  pivot_longer(starts_with("FEN")) %>%
+  mutate(value = log1p(value)) %>%
+  lme4::lmer(value ~ Trt*(Time) + (1|name), data=.) %>%
+  car::Anova(.)
+  emmeans::emmeans(., pairwise~Trt|Time)
+
+dread_data %>% filter(Exp == "Refeed") %>%
+  pivot_longer(starts_with("FEN")) %>%
+  mutate(value = log1p(value)) %>%
+  lme4::lmer(value ~ Trt*(Time) + (1|name), data=.) %>%
+  car::Anova(.)
+  emmeans::emmeans(., pairwise~Trt|Time)
+
+data <- read.csv("glp1r_leptin/2(A)_DIO:Chow_Glp1RCre; LepRFlox Body composition BW - 09 26 2024 update.csv") %>% 
+  mutate(X = c("Female_Chow","Male_Chow","Male_HFD")) %>% 
+  pivot_longer(-X) %>% 
+  mutate(name = gsub("[.][0-9]","", name)) %>% 
+  separate(X, into=c("sex","diet"), sep="_") 
+```
+
+```{r}
+readxl::read_xlsx("/Users/lhv464/glp1r_leptin/Agrp_Glp1R LepRflox Feeding_TP.DBR 05.2023.xlsx", sheet = 2) %>%
+  janitor::clean_names() %>%
+  dplyr::select(mouse, sex, genotype, treatment, body_weight, leptin, insulin) %>%
+  pivot_longer(c(leptin, insulin)) %>%
+  filter(treatment %in% c("DIO", "Vehicle")) %>%
+  nest(-name) %>%
+  mutate(mod = purrr::map(data, function(x) {
+    lm(log1p(value)~genotype*treatment + sex + body_weight, data=x) %>%
+      emmeans::emmeans(., pairwise~genotype|treatment) %$%
+      contrasts %>% 
+      data.frame()
+  })
+  ) %>%
+  unnest(mod)
+  
+lep <- readxl::read_xlsx("/Users/lhv464/glp1r_leptin/Agrp_Glp1R LepRflox Feeding_TP.DBR 05.2023.xlsx", sheet = 2) %>%
+  janitor::clean_names() %>%
+  dplyr::select(mouse, sex, genotype, treatment, body_weight, leptin) %>%
+  mutate(genotype = factor(genotype),
+         genotype = relevel(genotype, "WT")) %>% 
+  pivot_longer(c(leptin)) %>%
+  filter(treatment %in% c("DIO", "Vehicle")) 
+
+lm(log1p(value)~genotype*treatment, data=lep) %>%
+  emmeans(., pairwise ~ genotype|treatment)
+  
+lep %>% 
+  ggplot(aes(x=relevel(factor(treatment),"Vehicle"), y=value, fill=genotype)) +
+  stat_summary(geom="col", alpha=0.8, position=position_dodge(), color="white") +
+  stat_summary(geom="errorbar", position=position_dodge(width=0.9), width=0.1) +
+  geom_point(aes(color=genotype), position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.9),
+             size = 2) +
+  scale_color_manual(values=cols) +
+  scale_fill_manual(values=cols) +
+  cowplot::theme_cowplot()
+
+ggsave("leptin_amts.pdf", h=4, w=4)
+
+label_trueminus <- function(x){
+  ifelse(sign(x) == -1, paste0("\u2212", abs(x)), x)
+}
+```
+
+```{r}
+processed_data <- readxl::read_xlsx("/Users/lhv464/glp1r_leptin/Agrp_Glp1R LepRflox Feeding_TP.DBR 05.2023.xlsx", sheet = 3, 
+                  col_types = c("date","date", "text", "numeric", "numeric", "text", "text", "text")) %>%
+  dplyr::select(-Notes, -`...8`) %>% 
+  inner_join(sample_groups_df, by=c("Mouse"="SampleID")) %>%
+  janitor::clean_names() %>% 
+  transmute(
+    date, food, body_weight,
+    diet = factor(diet),
+    mouse = factor(mouse),
+    group=factor(group),
+    # replace the incorrect 1899 date with the actual Date column
+    hour = format(time, format = "%H:%M:%S", tz="UTC"),  # Convert to HH:MM:SS
+    datetime = as.POSIXct(paste(date, hour), format="%Y-%m-%d %H:%M:%S", tz="UTC")
+    ) %>%
+  arrange(mouse) %>%
+  group_by(mouse, diet, group) %>% 
+  mutate(lag = lag(food), intake = lag-food,
+         time_diff = as.numeric(datetime - lag(datetime)),
+         kcal = ifelse(grepl("Chow", diet), intake*2.89, intake*5.24),
+         day_diff =  as.numeric(datetime - lag(datetime)),
+         date_adjusted = as.Date(datetime-hours(12)))
+```
+```{r}
+library(emmeans)
+
+bw_data <- processed_data %>%
+  group_by(mouse, date, group, diet) %>%
+  summarise(bw = max(body_weight, na.rm=T)) %>%
+  filter(!is.infinite(bw)) %>%
+  group_by(mouse) %>%
+  mutate(norm = mean(bw[date<"2025-01-06"], na.rm = TRUE),
+         time = factor((date - min(date))/(60*60*24)),
+         plot_x = as.numeric(as.character(time))) 
+
+
+model_cum <- lme4::lmer(log(bw) ~ group * factor(time) + norm + (1 | mouse), data = bw_data %>%
+                          filter(!grepl("Chow", diet), plot_x<14))
+car::Anova(model_cum)
+ 
+# Get Pairwise Comparisons
+pval_bw <- model_cum %>%
+  emmeans(pairwise ~ group | time) %$%
+  # Extract contrasts as a DataFrame
+  contrasts %>%
+  data.frame() %>%
+  mutate(adj = p.adjust(p.value, method="BH")) %>%
+  print()
+```
+
+```{r}
+bw_switchdiet <- bw_data %>% 
+  ggplot() +
+  aes(x=plot_x, y=bw/norm, color=group, fill=group) +
+  stat_summary(geom="point", size=2) +
+  stat_summary(geom="line", size=1) +
+  stat_summary(geom="ribbon", alpha=0.5, size=0) +
+  cowplot::theme_cowplot() +
+  labs(y = "Body Weight (g)") +
+ # geom_vline(xintercept=3, lty=2, size=1, color="grey50") +
+  scale_color_manual(values=cols) +
+  scale_fill_manual(values=cols) +
+  scale_x_continuous(breaks = seq(0,60, by=7))
+
+bw_switchdiet
+
+bw_switchdiet +
+  geom_text(data = pval_bw %>%
+              inner_join(bw_data %>% filter(group == "Glp1R_LepR_KO") %>% 
+                           group_by(time, plot_x) %>% summarise(mean = mean(bw/norm))) %>%
+              mutate(
+                label = case_when(
+                  adj < 0.001 ~ "***",
+                  adj < 0.01 ~ "**",
+                  adj < 0.05 ~ "*",
+                  TRUE ~ ""
+                ),
+                y.position = mean +0.05
+              ),
+            aes(x = plot_x, y = y.position, label = label),
+            inherit.aes = FALSE) +
+  labs(x="Time", y = "Body Weight (g)")
+ggsave("bw_hfd.pdf", h=4, w=6)
+```
+
+```{r}
+hfd_full_intake <- processed_data %>%
+  filter(!is.na(intake)) %>%
+  group_by(mouse, date_adjusted, diet, group) %>%
+  reframe(sum = sum(kcal), tot_time = sum(time_diff)) %>%
+  group_by(mouse) %>%
+  mutate(cum_int = cumsum(sum), group,
+         norm = mean(sum[date_adjusted<"2025-01-06"], na.rm = TRUE),
+         time= factor(1:n())) 
+
+
+model_cum <- lme4::lmer(log(cum_int) ~ group * factor(time) + norm + (1 | mouse), 
+                        data = hfd_full_intake %>% filter(!grepl("Chow", diet)))
+
+car::Anova(model_cum)
+ 
+# Get Pairwise Comparisons
+pval_cum <- model_cum %>%
+  emmeans(pairwise ~ group | time) %$%
+  contrasts %>%
+  data.frame() %>%
+  mutate(adj = p.adjust(p.value)) %>%
+  print()
+
+hist(hfd_full_intake$norm)
+```
+
+```{r}
+cum_kcal <- hfd_full_intake %>% 
+  #filter(date_adjusted>"2025-01-06") %>%
+  ggplot() +
+  aes(x = as.numeric(as.character(time)), y = cum_int, color = group, fill=group) +
+  stat_summary(geom="point", size=2) +
+  stat_summary(geom="line", size=1) +
+  stat_summary(geom="ribbon", alpha=0.5, size=0) +
+  cowplot::theme_cowplot() +
+  labs(y = "Cumulative Food Intake (kCal)") +
+ # geom_vline(xintercept=3, lty=2, size=1, color="grey50") +
+  scale_color_manual(values=cols) +
+  scale_fill_manual(values=cols) +
+  scale_x_continuous(breaks = c(0:max(as.numeric(as.character(hfd_full_intake$time)))))
+  
+ggsave("cum_kcal.pdf", h=4, w=6)
+
+cum_kcal +
+  geom_text(data = pval_cum %>%
+              inner_join(hfd_full_intake %>% 
+                           filter(group == "Glp1R_LepR_KO") %>% 
+                           group_by(time) %>%
+                           summarise(mean = mean(cum_int))) %>%
+              mutate(
+                label = case_when(
+                  adj < 0.001 ~ "***",
+                  adj < 0.01 ~ "**",
+                  adj < 0.05 ~ "*",
+                  TRUE ~ ""
+                ),
+                y.position = mean+10
+              ),
+            aes(x = as.numeric(as.character(time)), y = y.position, label = label),
+            inherit.aes = FALSE) +
+  labs(x="Date", y="Cumulative Intake (kcal)")
+
+ggsave("cum_kcal.pdf")
+```
+
+```{r}
+hfd_model_data <- hfd_full_intake %>% 
+  mutate(sum = (sum), 
+         norm = (norm),
+         time=factor(time))
+
+
+model_cum <- lme4::lmer(log(sum) ~ group * time +  (norm) + (1 | mouse), 
+                        data = hfd_model_data  %>% filter(!grepl("Chow", diet)))
+car::Anova(model_cum, type="II")
+
+pval_daily <- emmeans(model_cum, pairwise ~ group | time) %$%
+  contrasts %>%
+  data.frame() %>%
+  mutate(adj = p.adjust(p.value)) %>%
+  print() 
+```
+```{r}
+hfd_full_intake %>% 
+  ggplot() +
+  aes(x=as.numeric(as.character(time)), sum, color=group, fill=group) +
+  stat_summary(geom="point", size=3) +
+  stat_summary(geom="line", size=1) +
+  stat_summary(geom="ribbon", alpha=0.5) +
+  cowplot::theme_cowplot() +
+  labs(y = "Food Intake (kcal)") +
+  geom_vline(xintercept=3, lty=2, size=1, color="grey50") +
+  scale_color_manual(values=cols) +
+  scale_fill_manual(values=cols) +
+  #scale_x_continuous(breaks = c(0:10), labels = label_trueminus(c(-3:7))) +
+  cowplot::theme_cowplot() +
+  geom_text(data = pval_daily %>%
+              inner_join(hfd_full_intake %>% 
+                           filter(group == "Glp1R_LepR_KO") %>% 
+                           group_by(time) %>%
+                           summarise(mean = mean(sum))) %>%
+              mutate(
+                label = case_when(
+                  adj < 0.001 ~ "***",
+                  adj < 0.01 ~ "**",
+                  adj < 0.05 ~ "*",
+                  TRUE ~ ""
+                ),
+                y.position = mean+2
+              ),
+            aes(x = as.numeric(as.character(time)), y = y.position, label = label),
+            inherit.aes = FALSE) 
+  
+ggsave("kcal_dio.pdf", h=4)
+```
+```{r}
+circ_data <- processed_data %>% 
+  group_by(mouse, date_adjusted, group) %>%
+  mutate(pct = kcal / sum(kcal), diet,
+         n = length(unique(diet)))  %>% 
+  group_by(date_adjusted) %>%
+  mutate(time=day(date_adjusted)-2) %>% 
+  ungroup() %>% 
+  mutate(night = ifelse(hour<12, "DC", "LC")) %>% 
+  #filter(n==1) %>%
+  # Compute Baseline Intake (mean kcal under 5LOD Chow per mouse)
+  group_by(mouse) %>%
+  mutate(night_kcal = mean(kcal[diet == "5LOD Chow" & night == "DC"], na.rm = TRUE),
+         day_kcal = mean(kcal[diet == "5LOD Chow" &  night == "LC"], na.rm = TRUE),
+         norm_kcal = mean(kcal[diet == "5LOD Chow"], na.rm = TRUE)
+  ) %>%
+  # Now filter out baseline diet after computing norm
+  ungroup()
+
+night_intake <- circ_data %>%
+  filter(night == "DC") %>%
+  mutate(time = as.factor(time))
+
+mod <- lme4::lmer(log(kcal) ~ (night_kcal) + group * time + (1 | mouse),
+                  data = night_intake %>% filter(!grepl("Chow", diet))) 
+
+car::Anova(mod, type="II")
+
+pval_night <- emmeans(mod, pairwise ~ group | time) %$%
+  contrasts %>%
+  data.frame() %>% 
+  mutate(adj = p.adjust(p.value)) %>%
+  inner_join(night_intake %>% distinct(time, .keep_all=T), by="time") %>%
+  print() 
+  
+
+day_intake <- circ_data %>%
+  filter(night == "LC") %>%
+  mutate(time = as.factor(time))
+
+mod <- lme4::lmer(log(kcal) ~ group * time + (day_kcal) + (1 | mouse), 
+                  data = day_intake  %>% filter(!grepl("Chow", diet))) 
+car::Anova(mod, type="III")
+
+pval_day <- emmeans(mod, pairwise ~ group | time) %$%
+  contrasts %>%
+  data.frame() %>% 
+  mutate(adj = p.adjust(p.value)) %>%
+  print()
+```
+```{r}
+circ_data %>%
+  filter(time<10) %>%
+  mutate(time = factor(time)) %>%
+  ggplot() +
+  aes(x=time, y=kcal/night_kcal, lty=group, color=group, fill=group) +
+  stat_summary(geom="point", size=3) +
+  stat_summary(geom="line", size=1) +
+  stat_summary(geom="ribbon", alpha=0.5, size=0) +
+  stat_summary(geom="line") +
+  scale_color_manual(values=cols) +
+  scale_fill_manual(values=cols) +
+  #scale_x_continuous(breaks = c(0:10), labels = label_trueminus(c(-3:7))) + 
+  cowplot::theme_cowplot() +
+  geom_vline(xintercept=3, lty=2, size=1, color="grey50") +
+  facet_wrap(~night, ncol=1, scales="free_y")# +
+  geom_text(data = pval_night %>%
+              inner_join(circ_data %>%
+                           filter(time<10) %>%
+                           mutate(time = factor(time)) %>%
+                           filter(group == "Glp1R_LepR_KO") %>% 
+                           group_by(time) %>%
+                           summarise(mean = mean(kcal))) %>%
+              mutate(
+                label = case_when(
+                  adj < 0.001 ~ "***",
+                  adj < 0.01 ~ "**",
+                  adj < 0.05 ~ "*",
+                  TRUE ~ ""
+                ),
+                y.position = mean+2
+              ),
+            aes(x = time, y = y.position, label = label),
+            inherit.aes = FALSE) 
+ggsave("circ_intake.pdf", h=6, w=6)
+```
+
+```{r fig.height=1, fig.width=2}
+mice_data <- readxl::read_xlsx("/Users/lhv464/glp1r_leptin/Agrp_Glp1R LepRflox Feeding_TP.DBR 05.2023.xlsx", sheet = 1) %>%
+  janitor::clean_names() %>%
+  dplyr::select(mouse, strain, genotype, sex)
+
+ghrelin_data_dio <- readxl::read_xlsx("/Users/lhv464/glp1r_leptin/Agrp_Glp1R LepRflox Feeding_TP.DBR 05.2023.xlsx", sheet = 7) %>%
+  janitor::clean_names() %>% 
+  filter(diet%in%c("HFD","DIO")) %>%
+  inner_join(mice_data, by="mouse") %>%
+  group_by(mouse) %>%
+  arrange(mouse) %>%
+  mutate(month = month(date),
+         year = year(date),
+         max_month = max(month)) %>%
+  filter(month == max_month) %>%
+  group_by(mouse, treatment) %>%
+  arrange(mouse) %>%
+  mutate(food = as.numeric(food),
+         bw=max(bw, na.rm = T),
+         hour = hour(time),
+         geno = ifelse(grepl("WT", genotype), "WT", "KO"),
+         treatment = ifelse(grepl("Ghrel", treatment), "Ghrelin", "Saline"),
+         intake = lag(food)-food) %>%
+  ungroup() %>%
+  filter(hour<17, !is.na(intake))
+
+ghrelin_data_dio %>% 
+  lme4::lmer(log1p(intake) ~ geno*treatment + (1|mouse), data=.) %>%
+  car::Anova(.) 
+
+pval_ghrelin <- ghrelin_data_dio %>% 
+  lme4::lmer(log1p(intake) ~ geno*treatment + (1|mouse), data=.) %>%
+  emmeans::emmeans(., pairwise~treatment|geno) %$%
+  contrasts %>%
+  data.frame() %>%
+  print()
+  
+ghrelin_data_dio %>% 
+  ggplot(aes(x = treatment, y = intake, fill = treatment)) +
+  stat_summary(geom="bar", width=0.8, color="black") +
+  stat_summary(geom="errorbar", width=0.1) +
+  geom_line(aes(group = mouse), color = "grey90") +
+  ggbeeswarm::geom_quasirandom(size=0.1, width = 0.1) +
+  facet_wrap(vars(geno), scales = "free_x", strip.position = "bottom")  +
+  labs(x = "Group") +
+  cowplot::theme_cowplot() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    strip.background = element_blank(),
+    panel.spacing = unit(0, units = "line")
+  ) +
+  scale_fill_manual(values = cols) +
+  labs(y="Total Intake (g)") 
+
+ggsave("ghrel_dio.pdf", h=3, w=3)
+```
+```{r}
+readxl::read_xlsx("/Users/lhv464/glp1r_leptin/Agrp_Glp1R LepRflox Feeding_TP.DBR 05.2023.xlsx", sheet = 7) %>%
+  janitor::clean_names() %>% 
+  filter(grepl("Leptin |Saline ", treatment), grepl("1mg", treatment), !is.na(food)) %>%
+  inner_join(mice_data, by="mouse") %>%
+  arrange(mouse) %>%
+  group_by(mouse, treatment) %>% 
+  mutate(timefromfood = as.numeric(difftime(date, min(date), units = "hours"))) %>% 
+  mutate(food=as.numeric(food), 
+         prev_intake = lag(food)-food, 
+         cum_intake =  cumsum(replace(prev_intake, is.na(prev_intake), 0)),
+         geno = ifelse(grepl("KO", genotype),"KO", "WT")) %>%
+  filter(timefromfood==24) %>%
+  lme4::lmer(log1p(cum_intake) ~ geno*treatment + (1|mouse), data=.) %>%
+  car::Anova(.)
+  
+
+```
+
+```{r}
+cols <- c("#EFAA6F","#E76225")
+
+refeed_data <- readxl::read_xlsx("/Users/lhv464/glp1r_leptin/Agrp_Glp1R LepRflox Feeding_TP.DBR 05.2023.xlsx", sheet = 5) %>%
+  janitor::clean_names() %>% 
+  arrange(mouse) %>%
+  mutate(datetime = as.POSIXct(paste(date, format(time, "%H:%M:%S")), format="%Y-%m-%d %H:%M:%S")) %>%
+  filter(grepl("refeed", treatment)) %>% 
+  dplyr::select(-time) %>% 
+  group_by(mouse) %>%
+  mutate(expstage = case_when(row_number() < min(which(is.na(bw)))-2 ~ "baseline", 
+                                row_number() == min(which(is.na(bw)))-2 ~ "start-fast",
+                                row_number() > min(which(is.na(bw)))-2 ~  "refeed"),
+         start_refeed = min(datetime[expstage == "refeed"]),
+         timefromrefeed = as.numeric(difftime(datetime, start_refeed, units = "hours")),
+         diet = ifelse(grepl("chow", treatment), "chow", "dio"),
+         food = ifelse(diet=="chow", food*2.89, food*5.24)) %>%
+  inner_join(mice_data, by="mouse") %>%
+  group_by(mouse, expstage, strain, treatment) %>% 
+  mutate(prev_intake = lag(food)-food, 
+         cum_intake =  cumsum(replace(prev_intake, is.na(prev_intake), 0)),
+         geno = ifelse(grepl("KO", genotype),"KO", "WT")) %>%
+  group_by(mouse, treatment) %>% 
+  mutate(min = min(datetime), timefromstart = difftime(datetime,min,  units = "hours")) %>% 
+  filter(!grepl("Agrp", strain)) %>% 
+  mutate(mean_fi = sum(prev_intake[timefromrefeed < -20]/3, na.rm=T)) %>%
+  dplyr::select(timefromrefeed, mouse, bw, food, datetime, expstage, geno, sex, prev_intake, cum_intake, mean_fi)
+
+refeed_data %>%
+  filter(geno == "WT") %>%
+  filter(timefromrefeed>0,timefromrefeed<20) %>%
+  mutate(time=factor(timefromrefeed), int = log1p(cum_intake)) %>%
+  lme4::lmer(int~time*treatment + (1|mouse), data=.) %>%
+  car::Anova(.)
+
+refeed_data %>%
+  filter(geno == "KO") %>%
+  filter(timefromrefeed>0,timefromrefeed<20) %>%
+  mutate(time=factor(timefromrefeed), int = log1p(cum_intake)) %>%
+  lme4::lmer(int~time*treatment + (1|mouse), data=.) %>%
+  car::Anova(.)
+
+pval_refeed <- refeed_data %>%
+  filter(timefromrefeed>0, timefromrefeed<20, timefromrefeed!="6") %>%
+  mutate(time=factor(timefromrefeed)) %>%
+  lme4::lmer(log1p(cum_intake)~time*treatment*geno + (1|mouse), data=.) %>%
+  emmeans(., ~treatment*time*geno) %>%
+  pairs(., by=c("time","geno"), adjust="none") %>%
+  data.frame() %>%
+  mutate(adj = p.adjust(p.value, method="BH")) %>%
+  print()
+
+refeed_data %>%
+  filter(timefromrefeed>-1, timefromrefeed<20) %>%
+  ggplot() +
+  aes(x=timefromrefeed, y=cum_intake, color=treatment, fill=treatment) +
+  stat_summary(geom="line") +
+  stat_summary(geom="point") +
+  stat_summary(geom="ribbon", alpha=0.5, size=0) +
+  geom_text(data = pval_refeed %>%
+              inner_join(refeed_data %>% filter(treatment == "chow_refeed") %>% 
+                           group_by(timefromrefeed) %>% summarise(mean = mean(cum_intake), time = factor(timefromrefeed))) %>%
+              distinct(contrast, time, geno, .keep_all = T) %>%
+              mutate(
+                label = case_when(
+                  adj < 0.001 ~ "***",
+                  adj < 0.01 ~ "**",
+                  adj < 0.05 ~ "*",
+                  TRUE ~ ""
+                ),
+                y.position = mean+1.5
+              ),
+            aes(x = as.numeric(as.character(time))-0.25, y = y.position, label = label),
+            inherit.aes = FALSE) +
+  facet_wrap(~geno) +
+  cowplot::theme_cowplot() +
+  scale_color_manual(values=cols) +
+  scale_fill_manual(values=cols) +
+  labs(y="Food Intake (kcal)")
+  
+ggsave("refeed.pdf", h=3, w=6)
+```
+
+```{r}
+lep_refeed_data <- readxl::read_xlsx("/Users/lhv464/glp1r_leptin/Agrp_Glp1R LepRflox Feeding_TP.DBR 05.2023.xlsx", sheet = 5) %>%
+  janitor::clean_names() %>% 
+  arrange(mouse) %>%
+  mutate(datetime = as.POSIXct(paste(date, format(time, "%H:%M:%S")), format="%Y-%m-%d %H:%M:%S")) %>%
+  filter(!grepl("refeed", treatment)) %>% 
+  mutate(trt = ifelse(grepl("Lep", treatment), "Lep", "Sal")) %>%
+  dplyr::select(-time) %>% 
+  group_by(mouse,trt) %>%
+  mutate(expstage = case_when(row_number() < min(which(is.na(food))) ~ "baseline", 
+                                row_number() == min(which(is.na(food))) ~ "start-fast",
+                                row_number() > min(which(is.na(food))) ~  "refeed"),
+         start_refeed = min(datetime[expstage == "refeed"]),
+         timefromrefeed = as.numeric(difftime(datetime, start_refeed, units = "hours")),
+         diet = ifelse(grepl("chow", treatment), "chow", "dio")) %>%
+  inner_join(mice_data, by="mouse") %>%
+  group_by(mouse, expstage, strain, trt) %>% 
+  mutate(prev_intake = lag(food)-food, 
+         cum_intake =  cumsum(replace(prev_intake, is.na(prev_intake), 0)),
+         geno = ifelse(grepl("KO", genotype),"KO", "WT")) %>%
+  group_by(mouse, trt) %>% 
+  mutate(min = min(datetime), timefromstart = difftime(datetime,min,  units = "hours")) %>% 
+  filter(!grepl("Agrp", strain)) %>% 
+  mutate(mean_fi = sum(prev_intake[timefromrefeed < -20]/3, na.rm=T)) %>%
+  dplyr::select(timefromrefeed,trt, mouse, bw, food, datetime, expstage, geno, sex, prev_intake, cum_intake, mean_fi)
+
+lep_refeed_data %>%
+  filter(timefromrefeed>-1, timefromrefeed<26, geno=="WT") %>%
+  mutate(time=factor(timefromrefeed), int = log1p(cum_intake)) %>%
+  lme4::lmer(int ~ log1p(mean_fi) + time*trt + sex + (1|mouse), data=.) %>%
+  car::Anova(.)
+
+lep_refeed_data %>%
+  filter(timefromrefeed>-1, timefromrefeed<26, geno=="KO") %>%
+  mutate(time=factor(timefromrefeed), int = log1p(cum_intake)) %>%
+  lme4::lmer(int ~ log1p(mean_fi) + time*trt + sex + (1|mouse), data=.) %>%
+  car::Anova(.)
+
+pval_lep_refeed <- lep_refeed_data %>%
+  filter(timefromrefeed>-1, timefromrefeed<26) %>%
+  mutate(time=factor(timefromrefeed), int = log1p(cum_intake)) %>%
+  lme4::lmer(int ~ log1p(mean_fi) + time*trt*geno + sex + (1|mouse), data=.) %>%
+  car::Anova(.)
+  emmeans(., pairwise~trt*time*geno) %>%
+  pairs(., by=c("time","geno"), adjust="none") %>%
+  data.frame() %>%
+  filter(time!=0) %>%
+  mutate(adj = p.adjust(p.value, method="fdr")) %>%
+  print()
+```
+
+```{r}
+cols <- c("#56C1AF","#155C5B")
+ref4 <- lep_refeed_data %>% 
+  mutate(group = interaction(geno, trt)) %>%
+  filter(timefromrefeed == 4) %>%
+  ggplot(aes(x = group, y = cum_intake, fill = trt)) +
+  stat_summary(geom="bar", width=0.8, color="black") +
+  geom_line(aes(group = mouse), color = "grey90") +
+  geom_point() +
+  facet_wrap(vars(geno), scales = "free_x", strip.position = "bottom")  +
+  labs(x = "Group") +
+  cowplot::theme_cowplot() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    strip.background = element_blank(),
+    panel.spacing = unit(0, units = "line")
+  ) +
+  scale_fill_manual(values = cols) +
+  lims(y=c(0,5)) +
+  theme(legend.position = "none") +
+  labs(y="Total Intake (g)")
+
+ref24 <- lep_refeed_data %>% 
+  mutate(group = interaction(geno, trt))%>%
+  filter(timefromrefeed==24) %>%
+  ggplot(aes(x = group, y = cum_intake, fill = trt)) +
+  stat_summary(geom="bar", width=0.8, color="black") +
+  geom_line(aes(group = mouse), color = "grey90") +
+  geom_point() +
+  facet_wrap(vars(geno), scales = "free_x", strip.position = "bottom")  +
+  labs(x = "Group") +
+  cowplot::theme_cowplot() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    strip.background = element_blank(),
+    panel.spacing = unit(0, units = "line")
+  ) +
+  scale_fill_manual(values = cols) +
+  lims(y=c(0,10)) +
+  labs(y="Total Intake (g)") +
+   theme(legend.position = "none") 
+
+ref4+ref24
+```
+
+```{r}
+library(tidyverse)
+bf_data <- readxl::read_xlsx("/Users/lhv464/glp1r_leptin/Agrp_Glp1R LepRflox Feeding_TP.DBR 05.2023.xlsx", sheet = 10) %>%
+  inner_join(sample_groups_df, by=c("Mouse"="SampleID")) %>%
+  janitor::clean_names() %>% 
+  mutate(
+    # replace the incorrect 1899 date with the actual Date column
+    day = day(date),  # Convert to HH:MM:SS
+    diet = factor(ifelse(day == 3, "Chow", "HFD")),
+    diet = relevel(diet, "HFD"),
+    time = as.numeric(case_when(day == 14 ~ 1, 
+                     day == 11 ~ 9,
+                     T ~ 0)),
+    ) %>%
+  group_by(mouse) %>%
+  arrange(mouse, time) %>%
+  mutate(chg_fm = fat_mass - lag(fat_mass),
+         chg_bw = body_weight - lag(body_weight),
+         ratio = chg_fm/chg_bw,
+         base = fat_mass[time == 0],
+         base_pct = fat_percent[time == 0],
+         base_chg = (fat_mass - base) / base * 100)
+
+mod <- lme4::lmer(chg_fm ~ group*factor(day) + (1|mouse), data=bf_data) 
+mod <- lm(chg ~ group, data=bf_data %>% filter(time==9)) 
+summary(mod)
+car::Anova(mod)
+emmeans::emmeans(mod, pairwise~group|day)
+
+
+```
+
+```{r}
+bf_data %>%
+  filter(day==14)
+
+ggplot(bf_data %>% mutate(chg_fm = ifelse(is.na(chg_fm), 0, chg_fm))) + 
+  aes(x=time, y=fat_mass-base, color=group, fill=group) +
+  stat_summary(geom="ribbon", alpha=0.5) +
+  stat_summary(geom="line") +
+  stat_summary(geom="point") +
+  scale_color_manual(values=cols) +
+  scale_fill_manual(values=cols) +
+  cowplot::theme_cowplot() +
+  labs(y="Total Fat Mass Gained (g)", x = "Weeks From Start of HFD") +
+  scale_x_continuous(breaks=c(0:10))
+
+ggsave("fat_mass_overtime.pdf", h=4, w=6)
+
+ggplot(bf_data %>% mutate(chg_fm = ifelse(is.na(chg_fm), 0, chg_fm))) + 
+  aes(x=time, y=fat_percent, color=group, fill=group) +
+  stat_summary(geom="ribbon", alpha=0.5) +
+  stat_summary(geom="line") +
+  stat_summary(geom="point") +
+  scale_color_manual(values=cols) +
+  scale_fill_manual(values=cols) +
+  cowplot::theme_cowplot() +
+  labs(y="Body Fat Percent", x = "Weeks From Start of HFD") +
+  scale_x_continuous(breaks=c(0:10))
+
+ggsave("fat_pct_overtime.pdf", h=4, w=6)
+```
+
+```{r}
+# A simpler approach to add statistics to your plot
+library(tidyverse)
+library(lme4)
+library(emmeans)
+library(ggplot2)
+library(cowplot)
+
+# Run your model and get pairwise comparisons
+model <- lmerTest::lmer(fat_percent ~ diet*group + (1|mouse), data = bf_data)
+emm <- emmeans(model, ~diet*group)
+comparisons <- pairs(emm)
+
+# Get summary statistics for your plot
+summary_data <- bf_data %>%
+  group_by(diet, group) %>%
+  summarize(
+    mean = mean(fat_percent),
+    se = sd(fat_percent)/sqrt(n()),
+    .groups = "drop"
+  )
+
+# Create the basic plot
+p <- ggplot(summary_data, aes(x = diet, y = mean, fill = group)) +
+  geom_col(position = position_dodge(0.8)) +
+  geom_errorbar(aes(ymin = mean-se, ymax = mean+se), 
+                position = position_dodge(0.8), 
+                width = 0.2) +
+  cowplot::theme_cowplot()
+
+# Add p-value annotation - simple approach
+p + annotate(
+  "text",
+  x = 1.5,  # Position in middle of plot
+  y = max(summary_data$mean + summary_data$se) * 1.1,  # Position above bars
+  label = paste("Diet*Group interaction p =", 
+               round(anova(model)["diet:group", "Pr(>F)"], 3))
+)
+
+# If you want to add specific pairwise comparisons:
+# Convert comparisons to data frame
+comp_df <- as.data.frame(comparisons) %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01 ~ "**", 
+      p.value < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  )
+
+# Print significant comparisons to console - you can add these manually
+# to your plot at specific locations if needed
+comp_df %>% 
+  filter(p.value < 0.05) %>%
+  select(contrast, p.value, significance)
+```
+```{r}
+# Complete code for plot with ALL pairwise comparisons
+library(tidyverse)
+library(lme4)
+library(emmeans)
+library(ggplot2)
+library(cowplot)
+library(lmerTest)  # For p-values in mixed models
+library(ggsignif)  # For significance brackets
+
+# Run the model with lmerTest to get p-values
+model <- lmerTest::lmer(fat_percent ~ diet*group + (1|mouse), data = bf_data)
+
+# Get the pairwise comparisons
+emm <- emmeans(model, ~ diet*group)
+comparisons <- pairs(emm)
+
+# Create basic plot
+p <- ggplot(bf_data) +
+  aes(x = diet, y = fat_mass, fill = diet) +
+  stat_summary(geom = "col", width=0.8, ) +
+  stat_summary(geom = "errorbar",  width = 0.2) +
+  geom_point(shape=21)+ 
+  geom_line(aes(group=mouse)) +
+  cowplot::theme_cowplot() +
+  facet_wrap(~group*time) +
+  labs(
+    title = "Fat Percentage by Diet and Group",
+    x = "Diet", 
+    y = "Fat Percentage",
+    fill = "Group"
+  )
+p
+```
+```{r}
+# Convert comparisons to data frame and format
+comp_df <- as.data.frame(comparisons) %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01 ~ "**", 
+      p.value < 0.05 ~ "*",
+      TRUE ~ "ns"
+    ),
+    # Extract diet and group from the contrast
+    from = str_split_fixed(contrast, " - ", 2)[,1],
+    to = str_split_fixed(contrast, " - ", 2)[,2]
+  )
+
+# Print all comparisons with p-values
+print(comp_df %>% select(contrast, estimate, p.value, significance))
+
+# Function to extract position on x-axis for a diet-group combination
+get_x_position <- function(diet_group, diet_levels, group_levels) {
+  parts <- str_split_fixed(diet_group, ",", 2)
+  diet <- str_trim(parts[1])
+  group <- str_trim(parts[2])
+  
+  diet_pos <- which(diet_levels == diet)
+  group_offset <- if(group == group_levels[1]) -0.2 else 0.2
+  
+  return(diet_pos + group_offset)
+}
+
+# Get unique diets and groups
+diet_levels <- unique(bf_data$diet)
+group_levels <- unique(bf_data$group)
+
+# Calculate max height for positioning brackets
+max_height <- max(tapply(bf_data$fat_percent, list(bf_data$diet, bf_data$group), 
+                        function(x) mean(x) + sd(x)/sqrt(length(x))), na.rm = TRUE)
+
+# Base plot
+base_plot <- p
+
+# Add all comparisons with brackets
+# We'll stack them at different heights
+bracket_height_increment <- max_height * 0.15  # Space between brackets
+
+# Add each comparison as a bracket
+for(i in 1:nrow(comp_df)) {
+  # Get x positions
+  x_from <- get_x_position(comp_df$from[i], diet_levels, group_levels)
+  x_to <- get_x_position(comp_df$to[i], diet_levels, group_levels)
+  
+  # Skip very distant comparisons if needed
+  # if(abs(x_from - x_to) > 2) next
+  
+  # Calculate height for this bracket
+  y_pos <- max_height * 1.1 + (i %% 5) * bracket_height_increment
+  
+  # Add annotation text with p-value
+  annotation <- paste0(
+    comp_df$significance[i], 
+    " (p=", formatC(comp_df$p.value[i], digits = 3, format = "f"), ")"
+  )
+  
+  # Add the bracket
+  base_plot <- base_plot + 
+    geom_signif(
+      comparisons = list(c(x_from, x_to)),
+      annotations = annotation,
+      y_position = y_pos,
+      tip_length = 0.02,
+      size = 0.5
+    )
+}
+
+# Add overall interaction p-value
+anova_result <- anova(model)
+base_plot <- base_plot + annotate(
+  "text",
+  x = mean(c(1, length(diet_levels))),  # Center of the plot
+  y = max_height * 1.05,  # Just above the highest bar
+  label = paste("Diet*Group interaction p =", 
+               formatC(anova_result["diet:group", "Pr(>F)"], digits = 3, format = "f")),
+  fontface = "bold"
+)
+
+# Final plot with clean theme
+final_plot <- base_plot + 
+  theme(
+    legend.position = "right",
+    axis.title = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+# Display the plot
+print(final_plot)
+```
+
