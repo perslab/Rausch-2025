@@ -21,6 +21,7 @@ sample_groups_df <- data.frame(
 
 cols <- c("#EBB395","#97BCDA")
 ```
+
 ```{r}
 library(ggplot2)
 library(tidyverse)
@@ -28,32 +29,38 @@ library(emmeans)
 
 dread_data <- readxl::read_xlsx("~/Downloads/testing.xlsx", sheet=3) %>% filter(Time!=0)
 
-dread_data %>% filter(Exp == "Ghrelin") %>%
+mod1 <- dread_data %>% filter(Exp == "Ghrelin") %>%
   pivot_longer(starts_with("FEN")) %>%
-  mutate(value = log1p(value)) %>%
-  lme4::lmer(value ~ Trt*(Time) + (1|name), data=.) %>%
-  car::Anova(.)
-  emmeans::emmeans(., pairwise~Trt|Time)
+  mutate(value = log1p(value),
+         time = factor(Time)) %>%
+  lme4::lmer(value ~ Trt*time + (1|name), data=.) 
 
-dread_data %>% filter(Exp == "DarkCycle") %>%
+car::Anova(mod1)
+emmeans::emmeans(mod1, ~Trt*time) %>%
+  pairs(., by="time") %>%
+  data.frame()
+
+mod2 <- dread_data %>% filter(Exp == "DarkCycle") %>%
   pivot_longer(starts_with("FEN")) %>%
-  mutate(value = log1p(value)) %>%
-  lme4::lmer(value ~ Trt*(Time) + (1|name), data=.) %>%
-  car::Anova(.)
-  emmeans::emmeans(., pairwise~Trt|Time)
+  mutate(value = log1p(value),
+         time = factor(Time)) %>%
+  lme4::lmer(value ~ Trt*time + (1|name), data=.) 
 
-dread_data %>% filter(Exp == "Refeed") %>%
+car::Anova(mod2)
+emmeans::emmeans(mod2, ~Trt*time) %>%
+  pairs(., by="time") %>%
+  data.frame()
+
+mod3 <- dread_data %>% filter(Exp == "Refeed") %>%
   pivot_longer(starts_with("FEN")) %>%
-  mutate(value = log1p(value)) %>%
-  lme4::lmer(value ~ Trt*(Time) + (1|name), data=.) %>%
-  car::Anova(.)
-  emmeans::emmeans(., pairwise~Trt|Time)
+  mutate(value = log1p(value),
+         time = factor(Time)) %>%
+  lme4::lmer(value ~ Trt*time + (1|name), data=.) 
 
-data <- read.csv("glp1r_leptin/2(A)_DIO:Chow_Glp1RCre; LepRFlox Body composition BW - 09 26 2024 update.csv") %>% 
-  mutate(X = c("Female_Chow","Male_Chow","Male_HFD")) %>% 
-  pivot_longer(-X) %>% 
-  mutate(name = gsub("[.][0-9]","", name)) %>% 
-  separate(X, into=c("sex","diet"), sep="_") 
+car::Anova(mod3)
+emmeans::emmeans(mod3, ~Trt*time) %>%
+  pairs(., by="time") %>%
+  data.frame()
 ```
 
 ```{r}
