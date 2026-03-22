@@ -1,0 +1,157 @@
+---
+title: "Supplementary Figure 2 — Diet dataset overview"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r setup_libraries_data}
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+
+source(here::here("R/basic_processing.R"))
+
+BASE_SIZE <- 8
+out_dir <- here::here("output_figures/paper/extended_figures/ed_fig2/")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+targets::tar_config_set(store = here::here("_targets"))
+targets::tar_load(arc_diet_labeled)
+
+# Map Campbell et al. reference labels onto diet dataset
+campbell_ref <- readRDS(here::here("external_data/Arc_Neurons_33_Clusters.rds"))
+DefaultAssay(campbell_ref) <- "integrated"
+arc_diet_labeled <- map_ref(arc_diet_labeled, dims = 30, ref = campbell_ref,
+                            ref_labels = "X10.clust_neurons",
+                            column_name = "campbell_labels")
+```
+
+## Panel a — UMAP colored by treatment
+
+```{r umap_treatment}
+p_treatment <- DimPlot(arc_diet_labeled, group.by = "treatment", shuffle = TRUE,
+                       cols = c("HFD" = "#E8682F", "Chow" = "#F0AD74",
+                                "Refeed" = "#58C2AF", "Fast" = "#165C5B")) +
+    theme_void() + coord_equal() + ggtitle("Treatment")
+
+ggsave(paste0(out_dir, "supp2a_umap_treatment.pdf"), plot = p_treatment, h = 4, w = 5)
+```
+
+## Panel b — UMAP colored by hash.mcl.ID (individual mouse)
+
+```{r umap_hashid}
+p_hash <- DimPlot(arc_diet_labeled, group.by = "hash.mcl.ID", shuffle = TRUE) +
+    theme_void() + coord_equal() + NoLegend() + ggtitle("Individual mouse (hash.mcl.ID)")
+
+ggsave(paste0(out_dir, "supp2b_umap_hashid.pdf"), plot = p_hash, h = 4, w = 5)
+```
+
+## Panel c — UMAP colored by hash_pool (batch)
+
+```{r umap_hashpool}
+p_pool <- DimPlot(arc_diet_labeled, group.by = "hash_pool", shuffle = TRUE) +
+    theme_void() + coord_equal() + ggtitle("Sequencing batch (hash_pool)")
+
+ggsave(paste0(out_dir, "supp2c_umap_hashpool.pdf"), plot = p_pool, h = 4, w = 5)
+```
+
+## Panel d — UMAP colored by sex
+
+```{r umap_sex}
+p_sex <- DimPlot(arc_diet_labeled, group.by = "sex", shuffle = TRUE) +
+    theme_void() + coord_equal() + ggtitle("Sex")
+
+ggsave(paste0(out_dir, "supp2d_umap_sex.pdf"), plot = p_sex, h = 4, w = 5)
+```
+
+## Panel e — Violin plots: UMI counts and gene counts per sample
+
+```{r qc_violins, fig.width=10, fig.height=4}
+p_umi <- VlnPlot(arc_diet_labeled, features = "nCount_RNA", group.by = "hash.mcl.ID", pt.size = 0) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 5),
+          legend.position = "none") +
+    labs(x = NULL, y = "UMI counts") + ggtitle(NULL)
+
+p_genes <- VlnPlot(arc_diet_labeled, features = "nFeature_RNA", group.by = "hash.mcl.ID", pt.size = 0) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 5),
+          legend.position = "none") +
+    labs(x = NULL, y = "Genes detected") + ggtitle(NULL)
+
+p_qc <- p_umi / p_genes
+ggsave(paste0(out_dir, "supp2e_qc_violins.pdf"), plot = p_qc, h = 6, w = 10)
+```
+
+## Panel f — UMAP colored by seurat_clusters
+
+```{r umap_clusters}
+p_clus <- DimPlot(arc_diet_labeled, group.by = "seurat_clusters", label = TRUE,
+                  label.size = 2, repel = TRUE, shuffle = TRUE) +
+    theme_void() + coord_equal() + NoLegend() + ggtitle("Unsupervised clusters")
+
+ggsave(paste0(out_dir, "supp2f_umap_clusters.pdf"), plot = p_clus, h = 4, w = 5)
+```
+
+## Panel g — UMAP colored by Campbell et al. neuron labels
+
+```{r umap_campbell}
+p_campbell <- DimPlot(arc_diet_labeled, group.by = "campbell_labels", label = TRUE,
+                      label.size = 1.5, repel = TRUE, shuffle = TRUE) +
+    theme_void() + coord_equal() + NoLegend() + ggtitle("Campbell et al. neuron labels")
+
+ggsave(paste0(out_dir, "supp2g_umap_campbell.pdf"), plot = p_campbell, h = 5, w = 6)
+```
+
+## Panel h — UMAP colored by Campbell mapping confidence
+
+```{r umap_mapping_score}
+p_score <- FeaturePlot(arc_diet_labeled, features = "prediction.score.max",
+                       order = TRUE) +
+    scale_color_viridis_c() +
+    theme_void() + coord_equal() + ggtitle("Campbell mapping confidence")
+
+ggsave(paste0(out_dir, "supp2h_umap_mapping_score.pdf"), plot = p_score, h = 4, w = 5)
+```
+
+## Panel i — Cells per sample per cluster
+
+```{r composition_barplot, fig.width=10, fig.height=4}
+p_comp <- arc_diet_labeled[[]] %>%
+    count(campbell_labels, hash.mcl.ID, treatment) %>%
+    ggplot(aes(x = campbell_labels, y = n, fill = hash.mcl.ID)) +
+    geom_col(position = "fill", color = "white", linewidth = 0.1) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 5),
+          legend.key.size = unit(0.3, "cm"),
+          legend.text = element_text(size = 5)) +
+    scale_y_continuous(labels = scales::percent) +
+    labs(x = NULL, y = "Proportion of cells", fill = "Mouse")
+
+ggsave(paste0(out_dir, "supp2i_composition.pdf"), plot = p_comp, h = 4, w = 10)
+```
+
+## Panel j — Body weight by treatment
+
+```{r bodyweight_boxplot, fig.width=4, fig.height=3}
+bw_df <- arc_diet_labeled[[]] %>%
+    distinct(hash.mcl.ID, treatment, weight) %>%
+    mutate(weight = as.numeric(weight),
+           treatment = factor(treatment, levels = c("Fast", "Refeed", "Chow", "HFD"))) %>%
+    filter(!is.na(weight))
+
+p_bw <- ggplot(bw_df, aes(x = treatment, y = weight, fill = treatment)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6, linewidth = 0.35) +
+    geom_jitter(width = 0.15, size = 1.5, alpha = 0.7, shape = 16) +
+    scale_fill_manual(values = c("HFD" = "#E8682F", "Chow" = "#F0AD74",
+                                  "Refeed" = "#58C2AF", "Fast" = "#165C5B")) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(x = NULL, y = "Body weight (g)")
+
+ggsave(paste0(out_dir, "supp2j_bodyweight.pdf"), plot = p_bw, h = 3, w = 3)
+```

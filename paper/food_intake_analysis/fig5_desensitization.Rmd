@@ -1,0 +1,345 @@
+---
+title: "Figure 5d–g: Agrp Neuron Desensitization in Obesity"
+author: "Dylan Rausch"
+output: html_notebook
+---
+
+Tests whether loss of leptin signaling in Glp1r neurons restores Agrp neuron
+responsiveness to orexigenic stimuli in DIO.
+
+- **5d**: Fasting-refeeding in chow vs DIO (WT vs KO)
+- **5g**: Ghrelin-induced feeding in DIO (WT vs KO)
+- **Plasma hormones**: Leptin and insulin levels (DIO vs vehicle, by genotype)
+
+## Setup
+
+```{r setup, message=FALSE}
+library(tidyverse)
+library(lme4)
+library(car)
+library(emmeans)
+library(cowplot)
+
+# -- Paths ---------------------------------------------------------------------
+feeding_file <- here::here("paper/food_intake_analysis/Agrp_Glp1R LepRflox Feeding_TP.DBR 05.2023.xlsx")
+out_dir <- here::here("output_figures/paper/extended_figures/ed_fig5_desensitization")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -- Sample metadata -----------------------------------------------------------
+mice_data <- readxl::read_xlsx(feeding_file, sheet = 1) %>%
+  janitor::clean_names() %>%
+  dplyr::select(mouse, strain, genotype, sex)
+
+cols_diet <- c("#EFAA6F", "#E76225")
+cols_ghrelin <- c("#EBB395", "#97BCDA")
+```
+
+---
+
+## Figure 5d — Fasting-Refeeding: Chow vs DIO
+
+### Data Processing
+
+```{r process-refeed}
+refeed_data <- readxl::read_xlsx(feeding_file, sheet = 5) %>%
+  janitor::clean_names() %>%
+  arrange(mouse) %>%
+  mutate(datetime = as.POSIXct(paste(date, format(time, "%H:%M:%S")),
+                               format = "%Y-%m-%d %H:%M:%S")) %>%
+  # Plain refeed experiments only (exclude leptin/saline pretreatment)
+  filter(grepl("refeed", treatment)) %>%
+  dplyr::select(-time) %>%
+  group_by(mouse) %>%
+  mutate(
+    expstage = case_when(
+      row_number() < min(which(is.na(bw))) - 2 ~ "baseline",
+      row_number() == min(which(is.na(bw))) - 2 ~ "start-fast",
+      row_number() > min(which(is.na(bw))) - 2 ~ "refeed"
+    ),
+    start_refeed = min(datetime[expstage == "refeed"]),
+    timefromrefeed = as.numeric(difftime(datetime, start_refeed, units = "hours")),
+    diet = ifelse(grepl("chow", treatment), "chow", "dio"),
+    # Convert to kcal (chow = 2.89 kcal/g, HFD = 5.24 kcal/g)
+    food = ifelse(diet == "chow", food * 2.89, food * 5.24)
+  ) %>%
+  inner_join(mice_data, by = "mouse") %>%
+  group_by(mouse, expstage, strain, treatment) %>%
+  mutate(
+    prev_intake = lag(food) - food,
+    cum_intake = cumsum(replace(prev_intake, is.na(prev_intake), 0)),
+    geno = ifelse(grepl("KO", genotype), "KO", "WT")
+  ) %>%
+  group_by(mouse, treatment) %>%
+  mutate(
+    min = min(datetime),
+    timefromstart = difftime(datetime, min, units = "hours")
+  ) %>%
+  filter(!grepl("Agrp", strain)) %>%
+  dplyr::select(timefromrefeed, mouse, bw, food, datetime, expstage, geno, sex,
+                prev_intake, cum_intake, treatment)
+```
+
+### Combined Model (Primary Analysis)
+
+**IMPORTANT:** The primary test is the `treatment:geno` interaction.
+This tests whether the DIO-associated blunting of refeeding differs by genotype.
+Time is modeled as log(hours) since cumulative intake follows a logarithmic
+time course (best AIC vs factor or linear time).
+
+```{r model-5d-combined}
+refeed_mod_data <- refeed_data %>%
+  filter(timefromrefeed > 0, timefromrefeed < 20) %>%
+  mutate(log_time = log(timefromrefeed))
+
+mod_5d <- lmer(log1p(cum_intake) ~ log_time * treatment * geno + (1 | mouse),
+               data = refeed_mod_data)
+
+# Primary result: treatment:geno interaction
+car::Anova(mod_5d, type = "II")
+```
+
+### Within-Genotype Models
+
+```{r within-geno-5d}
+# WT: does diet blunt refeeding?
+mod_5d_wt <- lmer(log1p(cum_intake) ~ treatment * log_time + (1 | mouse),
+                  data = refeed_mod_data %>% filter(geno == "WT"))
+cat("WT model:\n")
+print(car::Anova(mod_5d_wt, type = "II"))
+
+# KO: does diet blunt refeeding?
+mod_5d_ko <- lmer(log1p(cum_intake) ~ treatment * log_time + (1 | mouse),
+                  data = refeed_mod_data %>% filter(geno == "KO"))
+cat("\nKO model:\n")
+print(car::Anova(mod_5d_ko, type = "II"))
+```
+
+### Post-hoc: Genotype Effect Within Diet at Each Timepoint
+
+```{r posthoc-5d}
+# Use a factor-time model for timepoint-specific contrasts (plot annotations)
+mod_5d_fac <- refeed_data %>%
+  filter(timefromrefeed > 0, timefromrefeed < 20) %>%
+  mutate(time = factor(timefromrefeed)) %>%
+  lmer(log1p(cum_intake) ~ time * treatment * geno + (1 | mouse), data = .)
+
+pval_refeed <- emmeans(mod_5d_fac, ~ treatment * time * geno) %>%
+  pairs(by = c("time", "geno"), adjust = "none") %>%
+  data.frame() %>%
+  mutate(adj = p.adjust(p.value, method = "BH"))
+
+pval_refeed
+```
+
+### Plot
+
+```{r plot-5d, fig.width=6, fig.height=3}
+refeed_data %>%
+  filter(timefromrefeed > -1, timefromrefeed < 20) %>%
+  ggplot(aes(x = timefromrefeed, y = cum_intake, color = treatment, fill = treatment)) +
+  stat_summary(geom = "line") +
+  stat_summary(geom = "point") +
+  stat_summary(geom = "ribbon", alpha = 0.5, linewidth = 0) +
+  geom_text(
+    data = pval_refeed %>%
+      inner_join(
+        refeed_data %>% filter(treatment == "chow_refeed") %>%
+          group_by(timefromrefeed) %>%
+          summarise(mean = mean(cum_intake), time = factor(timefromrefeed), .groups = "drop"),
+        by = "time"
+      ) %>%
+      distinct(contrast, time, geno, .keep_all = TRUE) %>%
+      mutate(
+        label = case_when(adj < 0.001 ~ "***", adj < 0.01 ~ "**", adj < 0.05 ~ "*", TRUE ~ ""),
+        y.position = mean + 1.5
+      ),
+    aes(x = as.numeric(as.character(time)) - 0.25, y = y.position, label = label),
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~ geno) +
+  cowplot::theme_cowplot(font_size = 8) +
+  scale_color_manual(values = cols_diet) +
+  scale_fill_manual(values = cols_diet) +
+  labs(x = "Hours from refeeding", y = "Food Intake (kcal)")
+
+ggsave(file.path(out_dir, "refeed.pdf"), h = 3, w = 6)
+```
+
+---
+
+## Figure 5g — Ghrelin Response in DIO
+
+### Data Processing
+
+```{r process-ghrelin}
+ghrelin_data_dio <- readxl::read_xlsx(feeding_file, sheet = 7) %>%
+  janitor::clean_names() %>%
+  filter(diet %in% c("HFD", "DIO")) %>%
+  inner_join(mice_data, by = "mouse") %>%
+  group_by(mouse) %>%
+  arrange(mouse) %>%
+  mutate(
+    month = month(date),
+    year = year(date),
+    max_month = max(month)
+  ) %>%
+  # Keep only the latest round of testing per mouse
+  filter(month == max_month) %>%
+  group_by(mouse, treatment) %>%
+  arrange(mouse) %>%
+  mutate(
+    food = as.numeric(food),
+    bw = max(bw, na.rm = TRUE),
+    hour = hour(time),
+    geno = ifelse(grepl("WT", genotype), "WT", "KO"),
+    treatment = ifelse(grepl("Ghrel", treatment), "Ghrelin", "Saline"),
+    intake = lag(food) - food
+  ) %>%
+  ungroup() %>%
+  filter(hour < 17, !is.na(intake))
+```
+
+### Combined Model (Primary Analysis)
+
+**The `geno:treatment` interaction** tests whether the ghrelin effect differs by
+genotype. This is the correct test for the claim that ghrelin fails to increase
+intake in DIO WT but does in KO.
+
+```{r model-5g}
+# Aggregate to total intake per mouse per treatment before modeling
+ghrelin_sum_dio <- ghrelin_data_dio %>%
+  group_by(mouse, geno, treatment) %>%
+  summarise(intake = sum(intake, na.rm = TRUE), .groups = "drop")
+
+mod_5g <- lmer(log1p(intake) ~ geno * treatment + (1 | mouse),
+               data = ghrelin_sum_dio)
+
+# Primary result: geno:treatment interaction
+car::Anova(mod_5g)
+```
+
+### Post-hoc Contrasts
+
+```{r posthoc-5g}
+# Ghrelin effect within each genotype
+emmeans(mod_5g, pairwise ~ treatment | geno)
+```
+
+### Plot
+
+```{r plot-5g, fig.width=3.5, fig.height=3.5}
+# Aggregate to one total intake per mouse per treatment
+ghrelin_sum <- ghrelin_data_dio %>%
+  group_by(mouse, geno, treatment) %>%
+  summarise(intake = sum(intake, na.rm = TRUE), .groups = "drop")
+
+# Get post-hoc p-values for brackets
+pval_ghr <- emmeans(mod_5g, pairwise ~ treatment | geno)$contrasts %>%
+  as.data.frame() %>%
+  mutate(label = case_when(p.value < 0.001 ~ "***", p.value < 0.01 ~ "**", p.value < 0.05 ~ "*", TRUE ~ "ns"))
+
+# Bracket positions
+bt_ghr <- ghrelin_sum %>%
+  group_by(geno, treatment) %>%
+  summarise(m = mean(intake), se = sd(intake) / sqrt(n()), .groups = "drop") %>%
+  group_by(geno) %>%
+  summarise(top = max(m + se), .groups = "drop")
+
+sig_ghr <- pval_ghr %>%
+  left_join(bt_ghr, by = "geno") %>%
+  mutate(y_brack = top * 1.12, y_text = top * 1.28) %>%
+  filter(label != "ns")
+
+p_ghr <- ghrelin_sum %>%
+  ggplot(aes(x = treatment, y = intake, fill = treatment)) +
+  stat_summary(geom = "bar", width = 0.8, color = "black", fun = mean) +
+  stat_summary(geom = "errorbar", width = 0.1, fun.data = mean_se) +
+  geom_line(aes(group = mouse), color = "grey80", linewidth = 0.4) +
+  geom_point(size = 0.8) +
+  facet_wrap(vars(geno), scales = "free_x", strip.position = "bottom") +
+  geom_segment(data = sig_ghr,
+               aes(x = 1, xend = 2, y = y_brack, yend = y_brack),
+               inherit.aes = FALSE, linewidth = 0.3) +
+  geom_segment(data = sig_ghr,
+               aes(x = 1, xend = 1, y = y_brack * 0.95, yend = y_brack),
+               inherit.aes = FALSE, linewidth = 0.3) +
+  geom_segment(data = sig_ghr,
+               aes(x = 2, xend = 2, y = y_brack * 0.95, yend = y_brack),
+               inherit.aes = FALSE, linewidth = 0.3) +
+  geom_text(data = sig_ghr, aes(x = 1.5, y = y_text, label = label),
+            inherit.aes = FALSE, size = 2.5) +
+  scale_fill_manual(values = cols_diet) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.35))) +
+  cowplot::theme_cowplot(font_size = 8) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    strip.background = element_blank(),
+    panel.spacing = unit(0, units = "line"),
+    legend.position = "none"
+  ) +
+  labs(x = NULL, y = "Total Intake (g)")
+
+ggsave(file.path(out_dir, "ghrel_dio.pdf"), plot = p_ghr, h = 3.5, w = 3.5)
+```
+
+---
+
+## Plasma Leptin & Insulin Levels
+
+```{r plasma-hormones}
+hormone_data <- readxl::read_xlsx(feeding_file, sheet = 2) %>%
+  janitor::clean_names() %>%
+  dplyr::select(mouse, sex, genotype, treatment, body_weight, leptin, insulin) %>%
+  pivot_longer(c(leptin, insulin)) %>%
+  filter(treatment %in% c("DIO", "Vehicle"))
+
+# Genotype × treatment interaction for each hormone
+hormone_contrasts <- hormone_data %>%
+  nest(data = -name) %>%
+  mutate(mod = purrr::map(data, function(x) {
+    lm(log1p(value) ~ genotype * treatment + sex + body_weight, data = x) %>%
+      emmeans(pairwise ~ genotype | treatment) %$%
+      contrasts %>%
+      data.frame()
+  })) %>%
+  unnest(mod)
+
+hormone_contrasts
+```
+
+### Leptin Levels Plot
+
+```{r plot-leptin, fig.width=4, fig.height=4}
+lep <- readxl::read_xlsx(feeding_file, sheet = 2) %>%
+  janitor::clean_names() %>%
+  dplyr::select(mouse, sex, genotype, treatment, body_weight, leptin) %>%
+  mutate(genotype = relevel(factor(genotype), "WT")) %>%
+  filter(treatment %in% c("DIO", "Vehicle"))
+
+lep %>%
+  ggplot(aes(x = relevel(factor(treatment), "Vehicle"), y = leptin, fill = genotype)) +
+  stat_summary(geom = "col", alpha = 0.8, position = position_dodge(), color = "white") +
+  stat_summary(geom = "errorbar", position = position_dodge(width = 0.9), width = 0.1) +
+  geom_point(aes(color = genotype),
+             position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.9), size = 2) +
+  scale_color_manual(values = cols_ghrelin) +
+  scale_fill_manual(values = cols_ghrelin) +
+  cowplot::theme_cowplot(font_size = 8) +
+  labs(x = NULL, y = "Plasma Leptin (ng/mL)")
+
+ggsave(file.path(out_dir, "leptin_amts.pdf"), h = 4, w = 4)
+```
+
+## Summary
+
+**Figure 5d** uses `log1p(cum_intake) ~ log(time) * treatment * geno + (1|mouse)`.
+Time is log-transformed because cumulative intake follows a logarithmic time
+course (best AIC). The primary test is the `treatment:geno` interaction.
+
+**Figure 5g** uses `log1p(intake) ~ geno * treatment + (1|mouse)`. The `geno:treatment`
+interaction (P=0.004) is the primary result, followed by within-genotype
+post-hoc contrasts.
+
+**Plasma hormones** use `log1p(value) ~ genotype * treatment + sex + body_weight`
+to test genotype differences in leptin/insulin while controlling for body weight.

@@ -1,0 +1,109 @@
+---
+title: "Extended Data Figure 6: Body Composition"
+author: "Dylan Rausch"
+output: html_notebook
+---
+
+Body composition (DEXA) data for Glp1rLepr-KO vs control mice across chow
+and HFD conditions. Tracks fat mass and body fat percentage over time.
+
+## Setup
+
+```{r setup, message=FALSE}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(car)
+library(emmeans)
+library(cowplot)
+
+# -- Paths ---------------------------------------------------------------------
+feeding_file <- here::here("paper/food_intake_analysis/Agrp_Glp1R LepRflox Feeding_TP.DBR 05.2023.xlsx")
+out_dir <- here::here("output_figures/paper/extended_figures/ed_fig6_bodycomp")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -- Sample groups -------------------------------------------------------------
+sample_groups_df <- data.frame(
+  SampleID = c(
+    "Q0944", "Q0946", "Q0948", "R0084", "R0085", "R0086", "R0089", "R0090", "R0093",
+    "Q0941", "Q0942", "Q0943", "Q0945", "Q0949", "Q0950", "R0087", "R0088", "R0091", "R0092"
+  ),
+  Group = c(rep("Glp1R_LepR_KO", 9), rep("Control", 10))
+)
+
+cols <- c("#EBB395", "#97BCDA")
+```
+
+## Data Processing
+
+```{r process-dexa}
+bf_data <- readxl::read_xlsx(feeding_file, sheet = 10) %>%
+  inner_join(sample_groups_df, by = c("Mouse" = "SampleID")) %>%
+  janitor::clean_names() %>%
+  mutate(
+    day = day(date),
+    diet = factor(ifelse(day == 3, "Chow", "HFD")),
+    diet = relevel(diet, "HFD"),
+    time = as.numeric(case_when(day == 14 ~ 1, day == 11 ~ 9, TRUE ~ 0))
+  ) %>%
+  group_by(mouse) %>%
+  arrange(mouse, time) %>%
+  mutate(
+    chg_fm = fat_mass - lag(fat_mass),
+    chg_bw = body_weight - lag(body_weight),
+    ratio = chg_fm / chg_bw,
+    base = fat_mass[time == 0],
+    base_pct = fat_percent[time == 0],
+    base_chg = (fat_mass - base) / base * 100
+  )
+```
+
+## Fat Mass Over Time
+
+```{r model-fat-mass}
+mod_fm <- lmer(chg_fm ~ group * factor(day) + (1 | mouse), data = bf_data)
+car::Anova(mod_fm)
+emmeans(mod_fm, pairwise ~ group | day)
+```
+
+### Fat Mass Plot
+
+```{r plot-fat-mass, fig.width=6, fig.height=4}
+ggplot(bf_data %>% mutate(chg_fm = ifelse(is.na(chg_fm), 0, chg_fm))) +
+  aes(x = time, y = fat_mass - base, color = group, fill = group) +
+  stat_summary(geom = "ribbon", alpha = 0.5) +
+  stat_summary(geom = "line") +
+  stat_summary(geom = "point") +
+  scale_color_manual(values = cols) +
+  scale_fill_manual(values = cols) +
+  cowplot::theme_cowplot(font_size = 8) +
+  labs(y = "Total Fat Mass Gained (g)", x = "Weeks From Start of HFD") +
+  scale_x_continuous(breaks = 0:10)
+
+ggsave(file.path(out_dir, "fat_mass_overtime.pdf"), h = 4, w = 6)
+```
+
+## Body Fat Percentage Over Time
+
+```{r model-fat-pct}
+mod_pct <- lmerTest::lmer(fat_percent ~ diet * group + (1 | mouse), data = bf_data)
+car::Anova(mod_pct)
+emmeans(mod_pct, ~ diet * group) %>% pairs()
+```
+
+### Fat Percentage Plot
+
+```{r plot-fat-pct, fig.width=6, fig.height=4}
+ggplot(bf_data %>% mutate(chg_fm = ifelse(is.na(chg_fm), 0, chg_fm))) +
+  aes(x = time, y = fat_percent, color = group, fill = group) +
+  stat_summary(geom = "ribbon", alpha = 0.5) +
+  stat_summary(geom = "line") +
+  stat_summary(geom = "point") +
+  scale_color_manual(values = cols) +
+  scale_fill_manual(values = cols) +
+  cowplot::theme_cowplot(font_size = 8) +
+  labs(y = "Body Fat Percent", x = "Weeks From Start of HFD") +
+  scale_x_continuous(breaks = 0:10)
+
+ggsave(file.path(out_dir, "fat_pct_overtime.pdf"), h = 4, w = 6)
+```

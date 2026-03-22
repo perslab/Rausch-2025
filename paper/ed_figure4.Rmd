@@ -1,0 +1,212 @@
+---
+title: "Extended Data Figure 4 — Leptin IP dataset overview"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r setup_libraries_data}
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+library(lme4)
+library(emmeans)
+
+source(here::here("R/basic_processing.R"))
+
+BASE_SIZE <- 8
+out_dir <- here::here("output_figures/paper/extended_figures/ed_fig4/")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+targets::tar_config_set(store = here::here("_targets"))
+targets::tar_load(arc_lepip)
+targets::tar_load(pseudobulk_lepip)
+targets::tar_load(celltypes)
+names(pseudobulk_lepip) <- celltypes
+targets::tar_load(lepip_celldist)
+
+# LGS genes
+lgs_genes <- read.csv(here::here("output_figures/paper/lgs/lgs_genes.csv"))
+leptin_geneset <- lgs_genes$gene[lgs_genes$value.var < 0]
+
+# Subset to WT, leptin IP dataset only
+arc_wt_lepip <- subset(arc_lepip, subset = geno == "wt" & dataset == "lepip")
+```
+
+## Panel a — UMAP colored by treatment (Lep/Sal)
+
+```{r umap_treatment}
+p_trt <- DimPlot(arc_wt_lepip, reduction = "ref.umap", group.by = "treatment",
+                 shuffle = TRUE, cols = c("Lep" = "#155C5B", "Sal" = "#56C1AF")) +
+    theme_void() + coord_equal() + ggtitle("Treatment")
+ggsave(paste0(out_dir, "ed4a_umap_treatment.pdf"), plot = p_trt, h = 4, w = 5)
+```
+
+## Panel b — UMAP colored by time post-injection
+
+```{r umap_time}
+p_time <- DimPlot(arc_wt_lepip, reduction = "ref.umap", group.by = "time", shuffle = TRUE) +
+    theme_void() + coord_equal() + ggtitle("Hours post-injection")
+ggsave(paste0(out_dir, "ed4a_umap_time.pdf"), plot = p_time, h = 4, w = 5)
+```
+
+## Panel c — UMAP colored by predicted celltype
+
+```{r umap_celltype}
+p_ct <- DimPlot(arc_wt_lepip, reduction = "ref.umap", group.by = "predicted.celltype",
+                label = TRUE, label.size = 2, repel = TRUE, shuffle = TRUE) +
+    theme_void() + coord_equal() + NoLegend() + ggtitle("Predicted cell type")
+ggsave(paste0(out_dir, "ed4a_umap_celltype.pdf"), plot = p_ct, h = 5, w = 6)
+```
+
+## Panel d — UMAP colored by hash_pool (batch)
+
+```{r umap_batch}
+p_batch <- DimPlot(arc_wt_lepip, reduction = "ref.umap", group.by = "hash_pool", shuffle = TRUE) +
+    theme_void() + coord_equal() + ggtitle("Sequencing batch")
+ggsave(paste0(out_dir, "ed4a_umap_batch.pdf"), plot = p_batch, h = 4, w = 5)
+```
+
+## Panel e — QC violins
+
+```{r qc_violins, fig.width=10, fig.height=4}
+p_umi <- VlnPlot(arc_wt_lepip, features = "nCount_RNA", group.by = "hash.mcl.ID", pt.size = 0) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 5), legend.position = "none") +
+    labs(x = NULL, y = "UMI counts") + ggtitle(NULL)
+
+p_genes <- VlnPlot(arc_wt_lepip, features = "nFeature_RNA", group.by = "hash.mcl.ID", pt.size = 0) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 5), legend.position = "none") +
+    labs(x = NULL, y = "Genes detected") + ggtitle(NULL)
+
+p_qc <- p_umi / p_genes
+ggsave(paste0(out_dir, "ed4a_qc_violins.pdf"), plot = p_qc, h = 6, w = 10)
+```
+
+## Panel f — Cell composition by treatment
+
+```{r composition, fig.width=10, fig.height=4}
+p_comp <- arc_wt_lepip[[]] %>%
+    count(predicted.celltype, treatment) %>%
+    ggplot(aes(x = predicted.celltype, y = n, fill = treatment)) +
+    geom_col(position = "dodge", color = "white", linewidth = 0.1) +
+    scale_fill_manual(values = c("Lep" = "#155C5B", "Sal" = "#56C1AF")) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 5)) +
+    labs(x = NULL, y = "Number of cells", fill = "Treatment")
+ggsave(paste0(out_dir, "ed4a_composition.pdf"), plot = p_comp, h = 4, w = 10)
+```
+
+## Panel g — scDist: transcriptional distance per cluster (Leptin vs Saline, WT only)
+
+```{r celldist_lepip, fig.width=6, fig.height=5}
+# Filter pre-computed scDist results to WT only
+lep_dist <- lepip_celldist$results %>%
+    rownames_to_column("cell_type") %>%
+    filter(grepl("_wt$", cell_type)) %>%
+    mutate(cell_type = gsub("_wt$", "", cell_type)) %>%
+    rename(estimate = `Dist.`, ci_lo = `95% CI (low)`, ci_hi = `95% CI (upper)`, pval = p.val) %>%
+    mutate(sig = pval < 0.05)
+
+p_celldist <- lep_dist %>%
+    ggplot(aes(x = reorder(cell_type, estimate), y = estimate, fill = sig)) +
+    geom_col(width = 0.7) +
+    geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi), width = 0.2) +
+    coord_flip() +
+    scale_fill_manual(values = c("TRUE" = "#155C5B", "FALSE" = "grey70"), guide = "none") +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    labs(x = NULL, y = "Transcriptional distance (Leptin vs Saline, WT)")
+
+ggsave(paste0(out_dir, "ed4_celldist_lepip.pdf"), plot = p_celldist, h = 5, w = 6)
+write_csv(lep_dist, paste0(out_dir, "ed4_celldist_lepip_wt.csv"))
+```
+
+## Panel h — LGS timecourse: all Lepr clusters
+
+```{r lgs_timecourse_all, fig.width=6, fig.height=4}
+arc_wt_lepip <- AddModuleScore(arc_wt_lepip, features = list(leptin_geneset), assay = "RNA")
+
+all_lepr_clusters <- c("Agrp", "12", "29", "26", "28")
+all_lepr_labels <- c("Agrp" = "AgRP", "12" = "Lepr/Glp1r", "29" = "POMC",
+                      "26" = "Tbx19", "28" = "Irx3")
+
+lgs_lepip_all <- arc_wt_lepip[[]] %>%
+    filter(predicted.celltype %in% all_lepr_clusters) %>%
+    mutate(treatment = factor(treatment, c("Lep", "Sal")),
+           ct_label = all_lepr_labels[as.character(predicted.celltype)],
+           ct_label = factor(ct_label, c("AgRP", "Lepr/Glp1r", "POMC", "Tbx19", "Irx3"))) %>%
+    group_by(treatment, ct_label, hash.mcl.ID, time) %>%
+    summarise(mean_lgs = mean(Cluster1), .groups = "drop")
+
+# Model per cell type, adjust across all
+lgs_lepip_emm <- lgs_lepip_all %>%
+    nest(data = -ct_label) %>%
+    mutate(
+        mod = purrr::map(data, ~lm(mean_lgs ~ treatment * factor(time), data = .x)),
+        emm = purrr::map(mod, ~emmeans(.x, pairwise ~ treatment | time)$contrasts %>% data.frame())
+    ) %>%
+    unnest(emm) %>%
+    ungroup() %>%
+    mutate(padj = p.adjust(p.value, "BH"),
+           sig = padj < 0.05)
+
+write_csv(lgs_lepip_emm, paste0(out_dir, "ed4_lgs_lepip_all_clusters_stats.csv"))
+
+# Plot
+lgs_plot_data <- lgs_lepip_emm %>%
+    mutate(ct_label = factor(ct_label, c("AgRP", "Lepr/Glp1r", "POMC", "Tbx19", "Irx3")))
+
+p_lgs_all <- ggplot(lgs_plot_data) +
+    aes(x = factor(time, levels = c("1", "3", "6", "24")), y = estimate,
+        color = ct_label, group = ct_label) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_line() +
+    geom_errorbar(aes(ymin = estimate - SE, ymax = estimate + SE), width = 0) +
+    geom_point(data = ~filter(.x, !sig), shape = 21, size = 2, fill = "white", stroke = 0.5) +
+    geom_point(data = ~filter(.x, sig), aes(fill = ct_label), shape = 21, size = 2, stroke = 0.5) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    labs(x = "Hours post-injection", y = "LGS (Leptin - Saline)", color = NULL, fill = NULL)
+
+ggsave(paste0(out_dir, "ed4_lgs_timecourse_all_clusters.pdf"), plot = p_lgs_all, h = 4, w = 5)
+
+# Print stats
+cat("LGS timecourse stats (all Lepr clusters):\n")
+lgs_lepip_emm %>%
+    dplyr::select(ct_label, time, estimate, p.value, padj) %>%
+    mutate(sig = case_when(padj < 0.001 ~ "***", padj < 0.01 ~ "**", padj < 0.05 ~ "*", padj < 0.1 ~ "+", TRUE ~ "")) %>%
+    arrange(ct_label, time) %>%
+    as.data.frame() %>%
+    print()
+```
+
+## Panel i — DE gene counts per cluster (Leptin vs Saline)
+
+```{r de_gene_counts, fig.width=6, fig.height=5}
+# Read DE counts generated by figure2.Rmd (WT only, hash_pool where possible)
+de_counts <- read.csv(here::here("output_figures/paper/figure2/tables/lepip_de_counts_all_clusters.csv"))
+
+de_counts <- de_counts %>%
+    mutate(total = n_up + n_down) %>%
+    arrange(desc(total))
+
+p_de_counts <- de_counts %>%
+    pivot_longer(c(n_up, n_down), names_to = "direction", values_to = "n") %>%
+    mutate(direction = ifelse(direction == "n_up", "Up", "Down"),
+           n_signed = ifelse(direction == "Down", -n, n)) %>%
+    ggplot(aes(x = reorder(cell_type, total), y = n_signed, fill = direction)) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_manual(values = c("Up" = "#C0392B", "Down" = "#2980B9")) +
+    geom_hline(yintercept = 0, linewidth = 0.3) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    labs(x = NULL, y = "Number of DE genes (Leptin vs Saline)", fill = NULL)
+
+ggsave(paste0(out_dir, "ed4_de_gene_counts.pdf"), plot = p_de_counts, h = 5, w = 6)
+
+write_csv(de_counts, paste0(out_dir, "ed4_de_gene_counts.csv"))
+cat("DE gene counts per cluster:\n")
+print(de_counts)
+```

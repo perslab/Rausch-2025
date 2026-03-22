@@ -1,0 +1,421 @@
+---
+title: "pSTAT3 Spatial Transcriptomics Analysis"
+subtitle: "Integration of QuPath IHC classification with 10x Xenium data"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+date: "Originally run June 2024; cleaned March 2026"
+---
+
+## Overview
+
+This notebook integrates pSTAT3 IHC classification (from QuPath) with matched 10x Xenium
+spatial transcriptomics data. The workflow:
+
+1. Loads Xenium data for 16 tissue regions (2 slides × 8 regions)
+2. Maps QuPath-classified pSTAT3+ cells onto Xenium cell segmentations via spatial join
+3. Identifies Lepr+ neurons using Gaussian mixture models
+4. Subclusters Lepr+ neurons and analyzes pSTAT3 enrichment by diet condition
+
+**QuPath classification details:** See `pstat3_methods.docx` for full documentation of the
+cell detection, ANN-MLP classifier (ann_stat3.json), and coordinate transformation pipeline.
+
+## Setup
+
+```{r setup, message=FALSE}
+library(Seurat)
+library(sf)
+library(mclust)
+library(tidyverse)
+library(ggalluvial)
+library(ggsignif)
+
+out_dir <- here::here("output_figures/paper/figure1/")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+options(future.globals.maxSize = 8 * 1024^3)  # 8 GiB for merging large spatial objects
+
+xenium_dir <- here::here("sc_preprocessing/xenium_qupath")
+```
+
+## 1. Load Xenium data and map pSTAT3+ cells
+
+For each tissue region, we:
+
+- Load the Xenium output as a Seurat object
+- Read the transformed pSTAT3+ cell centroids (classified by QuPath, transformed to Xenium coordinates)
+- Perform a spatial join to identify which Xenium cells overlap with pSTAT3+ centroids
+- Label overlapping cells as "pos" in the Seurat metadata
+
+```{r load-xenium-737, message=FALSE}
+# Slide 21737: regions 1-8, sections 1-8
+val <- 1:8
+s.list.737 <- lapply(val, function(x) {
+  obj <- LoadXenium(paste0(xenium_dir, "/xenium_output/",
+                           "output-XETG00161__0021737__Region_", x, "__20240529__110948/"),
+                    segmentations = "cell")
+
+  # Read transformed pSTAT3+ centroids (from QuPath ann_stat3 classifier, affine-transformed)
+  pos_cells <- data.table::fread(
+    paste0(xenium_dir, "/stat3_transformed_ann/renamed_", x, "_cells.csv.gz")
+  ) %>%
+    data.frame() %>%
+    dplyr::rename(x = x_centroid, y = y_centroid)
+
+  # Convert Xenium segmentation polygons to sf
+  sf_object <- st_as_sf(obj@images$fov@boundaries$segmentations)
+  sf_object[["cell_id.xenium"]] <- colnames(obj)
+
+  # Convert pSTAT3+ centroids to sf points and spatially join with Xenium polygons
+  sf_points <- st_as_sf(pos_cells, coords = c("x", "y"), crs = st_crs(sf_object))
+  joined <- st_join(sf_object, sf_points)
+
+  # Label Xenium cells that contain a pSTAT3+ centroid
+  cellstolab <- joined$cell_id.xenium[!is.na(joined$cell_id)]
+  obj[["stat3"]] <- ifelse(colnames(obj) %in% cellstolab, "pos", "neg")
+  obj[["section"]] <- rep(x, ncol(obj))
+  obj[["slide"]] <- "737"
+  return(obj)
+})
+```
+
+```{r load-xenium-767, message=FALSE}
+# Slide 21767: regions 1-8, sections 9-16
+val <- 9:16
+s.list.767 <- lapply(val, function(x) {
+  y <- x - 8
+  obj <- LoadXenium(paste0(xenium_dir, "/xenium_output/",
+                           "output-XETG00161__0021767__Region_", y, "__20240529__110948/"),
+                    segmentations = "cell")
+
+  pos_cells <- data.table::fread(
+    paste0(xenium_dir, "/stat3_transformed_ann/renamed_", x, "_cells.csv.gz")
+  ) %>%
+    data.frame() %>%
+    dplyr::rename(x = x_centroid, y = y_centroid)
+
+  sf_object <- st_as_sf(obj@images$fov@boundaries$segmentations)
+  sf_object[["cell_id.xenium"]] <- colnames(obj)
+  sf_points <- st_as_sf(pos_cells, coords = c("x", "y"), crs = st_crs(sf_object))
+  joined <- st_join(sf_object, sf_points)
+
+  cellstolab <- joined$cell_id.xenium[!is.na(joined$cell_id)]
+  obj[["stat3"]] <- ifelse(colnames(obj) %in% cellstolab, "pos", "neg")
+  obj[["section"]] <- rep(x, ncol(obj))
+  obj[["slide"]] <- "767"
+  return(obj)
+})
+```
+
+## 2. Merge and annotate metadata
+
+```{r merge-and-annotate}
+seur <- merge(s.list.767[[1]], c(s.list.767[-1], s.list.737))
+
+# Assign diet groups: sections 1-4 & 9-12 = chow; 5-8 & 13-16 = DIO (high-fat diet)
+seur[["diet"]] <- ifelse(seur$section %in% c(1:4, 9:12), "chow", "dio")
+
+# Assign animal IDs
+seur[["animal"]] <- case_when(
+  seur$section %in% 1:3        ~ "animal1",
+  seur$section %in% c(4, 12)   ~ "animal2",
+  seur$section %in% 5:7        ~ "animal3",
+  seur$section %in% c(8, 16)   ~ "animal4",
+  seur$section %in% 9:11       ~ "animal5",
+  seur$section %in% 13:15      ~ "animal6"
+)
+
+seur <- JoinLayers(seur)
+seur <- NormalizeData(seur, normalization.method = "CLR", margin = 2)
+```
+
+## 3. Cell type classification using Gaussian mixture models
+
+Classify cells as positive/negative for marker genes using 2-component GMMs
+on CLR-normalized expression (non-zero cells only).
+
+```{r gmm-classification-functions}
+classify_and_assign_cells <- function(seurat_obj, gene_list, assay = "RNA",
+                                       n_components = 2, plot = TRUE) {
+  seurat_obj <- NormalizeData(seurat_obj, normalization.method = "CLR",
+                               margin = 2, assay = assay)
+
+  classify_gene <- function(gene) {
+    expr <- GetAssayData(seurat_obj, layer = "data", assay = assay)[gene, ]
+    det <- expr[expr > 0]
+
+    gmm <- Mclust(det, G = n_components)
+    high_component <- which.max(gmm$parameters$mean)
+    is_positive <- names(det)[gmm$classification == high_component]
+    vec <- names(expr) %in% is_positive
+
+    if (plot) {
+      p <- ggplot(data.frame(expression = det), aes(x = expression)) +
+        geom_histogram(aes(y = after_stat(density)), bins = 50, color = "black") +
+        geom_density(color = "red") +
+        ggtitle(paste("Expression Distribution for", gene)) +
+        theme_minimal()
+      for (i in 1:n_components) {
+        p <- p + stat_function(
+          fun = dnorm,
+          args = list(mean = gmm$parameters$mean[i],
+                      sd = sqrt(gmm$parameters$variance$sigmasq[i])),
+          aes(color = factor(i))
+        )
+      }
+      print(p)
+    }
+    return(vec)
+  }
+
+  classification_df <- as.data.frame(sapply(gene_list, classify_gene))
+  rownames(classification_df) <- colnames(seurat_obj)
+
+  # Filter for Lepr+ cells, then assign subtypes
+  lepr_pos_df <- classification_df %>% filter(Lepr == TRUE) %>% select(-Lepr)
+
+  assign_cell_type <- function(row) {
+    positive_genes <- names(row)[row]
+    if (length(positive_genes) == 0) return("Negative")
+    else if (length(positive_genes) == 1) return(positive_genes)
+    else return("Doublet")
+  }
+
+  cell_assignments <- apply(lepr_pos_df, 1, assign_cell_type)
+  result_df <- data.frame(cell_type = cell_assignments, stringsAsFactors = FALSE) %>%
+    rownames_to_column("cell_id")
+
+  return(list(full_classification = classification_df,
+              lepr_positive_assignments = result_df))
+}
+```
+
+```{r run-gmm-classification}
+genes_of_interest <- c("Agrp", "Glp1r", "Pomc", "Lepr", "Crh", "Irx3",
+                        "Nr5a1", "Kiss1", "Ghrh", "Pirt")
+results <- classify_and_assign_cells(seur, genes_of_interest, assay = "Xenium")
+
+table(results$full_classification$Glp1r)
+table(results$lepr_positive_assignments$cell_type)
+
+seur <- AddMetaData(seur, results$lepr_positive_assignments %>% column_to_rownames("cell_id"))
+```
+
+## 4. Lepr+ neuron subclustering
+
+```{r lepr-subset-cluster}
+# Subset to Lepr+ cells
+seur_lepr <- subset(seur, cells = colnames(seur)[results$full_classification$Lepr == TRUE])
+seur_lepr <- NormalizeData(seur_lepr, assay = "Xenium", margin = 2)
+seur_lepr <- ScaleData(seur_lepr)
+seur_lepr <- RunPCA(seur_lepr, features = rownames(seur_lepr))
+seur_lepr <- FindNeighbors(seur_lepr, dims = 1:30)
+seur_lepr <- FindClusters(seur_lepr, resolution = 0.5)
+seur_lepr <- RunUMAP(seur_lepr, dims = 1:30)
+
+DimPlot(seur_lepr,
+        cells.highlight = WhichCells(seur_lepr, expression = stat3 == "pos"),
+        label = TRUE)
+```
+
+```{r remove-non-neuronal}
+# Remove non-neuronal clusters (identified by marker gene inspection)
+seur_lepr_neur <- subset(seur_lepr, idents = c(0, 9, 8, 4, 12), invert = TRUE)
+
+seur_lepr_neur <- NormalizeData(seur_lepr_neur, assay = "Xenium", margin = 2)
+seur_lepr_neur <- ScaleData(seur_lepr_neur)
+seur_lepr_neur <- RunPCA(seur_lepr_neur, features = rownames(seur_lepr_neur))
+seur_lepr_neur <- FindNeighbors(seur_lepr_neur, dims = 1:30)
+seur_lepr_neur <- FindClusters(seur_lepr_neur, resolution = 0.5)
+seur_lepr_neur <- RunUMAP(seur_lepr_neur, dims = 1:30)
+
+DimPlot(seur_lepr_neur,
+        cells.highlight = WhichCells(seur_lepr_neur, expression = stat3 == "pos"),
+        label = TRUE)
+```
+
+## 5. Cluster marker genes
+
+```{r cluster-markers, fig.width=4, fig.height=4}
+marks <- FindAllMarkers(seur_lepr_neur, only.pos = TRUE)
+marks %>% group_by(cluster) %>% dplyr::slice(1:2) %>% pull(gene)
+```
+
+```{r marker-violin-plots, fig.width=4, fig.height=4}
+scCustomize::Stacked_VlnPlot(
+  seur_lepr_neur,
+  c("Glp1r", "Nr5a1", "Agrp", "Nts", "Pomc", "Irx3", "Tbx19"),
+  slot = "counts",
+  idents = c(0, 2, 3, 8, 4, 9, 12)
+)
+```
+
+## 6. UMAP visualization
+
+```{r umap-panels, fig.width=12, fig.height=5}
+p <- DimPlot(seur_lepr_neur, label = FALSE, shuffle = TRUE) +
+  theme_void() + NoLegend() + coord_equal()
+p2 <- LabelClusters(p, id = "ident", fontface = "bold", color = "black", size = 4, repel = FALSE)
+
+p2 + (DimPlot(seur_lepr_neur, group.by = "diet", shuffle = TRUE,
+              cells.highlight = WhichCells(seur_lepr_neur, expression = stat3 == "pos"),
+              sizes.highlight = 0.2) +
+        theme_void() + NoLegend() + coord_equal()) & ggtitle(NULL)
+
+ggsave(file.path(out_dir, "lepr_spatial.pdf"), width = 8, height = 4)
+```
+
+## 7. pSTAT3 enrichment analysis
+
+### 7.1 Overall pSTAT3+ proportion by diet
+
+```{r pstat3-overall, fig.width=4, fig.height=3}
+model <- seur_lepr_neur[[]] %>%
+  group_by(stat3, diet, animal) %>%
+  dplyr::count() %>%
+  pivot_wider(names_from = stat3, values_from = n, values_fill = 0) %>%
+  mutate(tot = neg + pos) %>%
+  glm(cbind(pos, neg) ~ diet, data = ., family = binomial)
+
+emmeans::emmeans(model, pairwise ~ diet)
+
+seur_lepr_neur[[]] %>%
+  group_by(stat3, diet, section, animal) %>%
+  dplyr::count() %>%
+  pivot_wider(names_from = stat3, values_from = n) %>%
+  mutate(pct = pos / (neg + pos)) %>%
+  group_by(animal, diet) %>%
+  summarise(mean = mean(pct), .groups = "drop") %>%
+  ggplot() +
+  aes(x = diet, y = mean) +
+  geom_jitter(width = 0.1) +
+  stat_summary(geom = "crossbar", aes(group = 1), width = 0.5) +
+  geom_signif(comparisons = list(c("dio", "chow")),
+              map_signif_level = FALSE, textsize = 0,
+              tip_length = c(0.8, 0.01), color = "black") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = NULL, y = "% pSTAT3(+)") +
+  ggthemes::theme_clean() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.background = element_blank()) +
+  NoLegend()
+
+ggsave(file.path(out_dir, "pstat_alllepr.pdf"), h = 3, w = 2)
+```
+
+### 7.2 pSTAT3+ proportion by cluster and diet
+
+```{r pstat3-by-cluster, fig.height=2, fig.width=4}
+barplot_data <- seur_lepr_neur[[]] %>%
+  filter(seurat_clusters %in% c(0, 2, 3, 4, 8, 9, 12)) %>%
+  group_by(seurat_clusters, stat3, animal, diet) %>%
+  dplyr::count() %>%
+  group_by(animal, seurat_clusters, diet) %>%
+  mutate(pct = n / sum(n)) %>%
+  filter(stat3 == "pos")
+
+all_combinations <- expand.grid(
+  factor = unique(barplot_data[["seurat_clusters"]]),
+  group = unique(barplot_data[["diet"]])
+)
+
+complete_data <- all_combinations %>%
+  full_join(barplot_data, by = c("factor" = "seurat_clusters", "group" = "diet")) %>%
+  mutate(value = ifelse(is.na(pct), 1e-5, pct))
+
+complete_data %>%
+  ggplot() +
+  aes(fct_rev(factor), value, fill = group) +
+  stat_summary(geom = "col", position = position_dodge(), color = "black") +
+  stat_summary(geom = "errorbar", width = 0.2, position = position_dodge(width = 0.9)) +
+  scale_y_continuous(labels = scales::percent) +
+  theme_bw() +
+  labs(x = NULL, y = NULL) +
+  coord_flip()
+
+ggsave(file.path(out_dir, "barplot.pdf"), h = 4, w = 3)
+```
+
+### 7.3 Binomial GLM: diet × cluster interaction
+
+```{r pstat3-glm}
+seur_lepr_neur[[]] %>%
+  filter(seurat_clusters %in% c(0, 2, 3, 4, 8, 9, 12)) %>%
+  mutate(seurat_clusters = factor(seurat_clusters)) %>%
+  group_by(stat3, diet, section, seurat_clusters, slide, animal) %>%
+  dplyr::count() %>%
+  ungroup() %>%
+  pivot_wider(names_from = stat3, values_from = n) %>%
+  mutate(tot = neg + pos) %>%
+  lme4::glmer(cbind(pos, tot - pos) ~ diet * seurat_clusters + (1|animal) + (1|slide),
+              data = ., family = binomial) %>%
+  emmeans::emmeans(., pairwise ~ diet | seurat_clusters) %$%
+  contrasts %>%
+  data.frame() %>%
+  mutate(padj = p.adjust(p.value, method = "BH")) %>%
+  arrange(p.value) %>%
+  { write.csv(., file.path(out_dir, "pstat3_glm_stats.csv"), row.names = FALSE); . }
+```
+
+### 7.4 Alluvial plot
+
+```{r alluvial, fig.width=4, fig.height=3}
+seur_lepr_neur[[]] %>%
+  group_by(stat3, diet, seurat_clusters) %>%
+  dplyr::count() %>%
+  ungroup() %>%
+  complete(stat3, diet, seurat_clusters, fill = list(n = 1)) %>%
+  filter(stat3 == "pos", seurat_clusters %in% c(0, 9, 2, 5, 11, 8, 3)) %>%
+  ggplot() +
+  aes(x = diet, y = n, fill = seurat_clusters, group = seurat_clusters) +
+  geom_col(width = 0.5, color = "white", linewidth = 0.1) +
+  geom_flow(aes(alluvium = seurat_clusters), alpha = 0.25, color = "white",
+            linewidth = 0.1, curve_type = "linear", width = 0.5) +
+  cowplot::theme_minimal_vgrid() +
+  theme(panel.grid.major = element_blank()) +
+  scale_x_discrete(labels = c("dio" = "HFD", "chow" = "Chow")) +
+  labs(x = NULL, y = "# pSTAT3+ Cells")
+
+ggsave(file.path(out_dir, "alluvialbar.pdf"), h = 3, w = 4.5)
+```
+
+## 8. Differential expression (diet effect within clusters)
+
+```{r de-analysis}
+# Example: DE in cluster 0 (Glp1r+ neurons), diet effect with animal as covariate
+marks <- FindMarkers(seur_lepr_neur, ident.1 = "dio", subset.ident = 0,
+                     group.by = "diet", slot = "counts",
+                     latent.vars = "animal", test.use = "negbinom")
+
+marks %>%
+  rownames_to_column("gene") %>%
+  ggplot() +
+  aes(avg_log2FC, -log10(p_val_adj)) +
+  geom_point() +
+  ggrepel::geom_text_repel(aes(label = gene)) +
+  labs(x = "log2(Fold Change)") +
+  ggthemes::theme_clean() +
+  theme(plot.background = element_blank()) +
+  NoLegend()
+
+ggsave(file.path(out_dir, "glp1r_marks.pdf"), h = 3, w = 5)
+```
+
+## 9. Leptin target gene expression by cluster
+
+```{r leptin-targets, fig.height=4, fig.width=4}
+scCustomize::Stacked_VlnPlot(
+  seur_lepr_neur,
+  idents = c(3, 8, 0, 4, 9, 2, 12),
+  c("Socs3", "Nlrc5", "Sbno2"),
+  split.by = "diet", pt.size = 0, slot = "counts"
+)
+ggsave(file.path(out_dir, "lep_targs.pdf"), h = 2, w = 5)
+```
+
+## Session info
+
+```{r session-info}
+sessionInfo()
+```

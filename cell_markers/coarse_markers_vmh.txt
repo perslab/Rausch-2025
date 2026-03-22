@@ -1,0 +1,7 @@
+>VMH_Neurons
+expressed: Nr5a1, Fezf1
+not expressed: Agrp, Pomc, Glp1r, Kiss1, Slc32a1
+
+>ARC_Neurons
+expressed: Slc32a1, Agrp, Pomc, Glp1r, Kiss1
+not expressed: Nr5a1, Fezf1

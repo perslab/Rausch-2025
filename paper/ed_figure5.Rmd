@@ -1,0 +1,100 @@
+---
+title: "Extended Data Figure 5 — GLP1R/Lepr-KO dataset overview"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r setup_libraries_data}
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+
+BASE_SIZE <- 8
+out_dir <- here::here("output_figures/paper/extended_figures/ed_fig5/")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+targets::tar_config_set(store = here::here("_targets"))
+targets::tar_load(arc_glp1rko_labeled)
+```
+
+## Panel a — UMAP colored by predicted celltype
+
+```{r umap_celltype}
+p_ct <- DimPlot(arc_glp1rko_labeled, reduction = "ref.umap", group.by = "predicted.celltype", label = TRUE,
+                label.size = 2, repel = TRUE, shuffle = TRUE) +
+    theme_void() + coord_equal() + NoLegend() + ggtitle("Predicted cell type")
+ggsave(paste0(out_dir, "ed5a_umap_celltype.pdf"), plot = p_ct, h = 5, w = 6)
+```
+
+## Panel b — UMAP colored by genotype
+
+```{r umap_geno}
+p_geno <- DimPlot(arc_glp1rko_labeled, reduction = "ref.umap", group.by = "geno", shuffle = TRUE,
+                  cols = c("wt" = "grey70", "mut" = "#C0392B")) +
+    theme_void() + coord_equal() + ggtitle("Genotype")
+ggsave(paste0(out_dir, "ed5a_umap_geno.pdf"), plot = p_geno, h = 4, w = 5)
+```
+
+## Panel c — UMAP colored by diet
+
+```{r umap_diet}
+p_diet <- DimPlot(arc_glp1rko_labeled, reduction = "ref.umap", group.by = "diet", shuffle = TRUE,
+                  cols = c("Chow" = "#F0AD74", "DIO" = "#E8682F")) +
+    theme_void() + coord_equal() + ggtitle("Diet")
+ggsave(paste0(out_dir, "ed5a_umap_diet.pdf"), plot = p_diet, h = 4, w = 5)
+```
+
+## Panel d — UMAP colored by sex
+
+```{r umap_sex}
+p_sex <- DimPlot(arc_glp1rko_labeled, reduction = "ref.umap", group.by = "sex", shuffle = TRUE) +
+    theme_void() + coord_equal() + ggtitle("Sex")
+ggsave(paste0(out_dir, "ed5a_umap_sex.pdf"), plot = p_sex, h = 4, w = 5)
+```
+
+## Panel e — QC violins
+
+```{r qc_violins, fig.width=10, fig.height=4}
+p_umi <- VlnPlot(arc_glp1rko_labeled, features = "nCount_RNA",
+                  group.by = "hash.mcl.ID", pt.size = 0) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 5),
+          legend.position = "none") +
+    labs(x = NULL, y = "UMI counts") + ggtitle(NULL)
+
+p_genes <- VlnPlot(arc_glp1rko_labeled, features = "nFeature_RNA",
+                    group.by = "hash.mcl.ID", pt.size = 0) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 5),
+          legend.position = "none") +
+    labs(x = NULL, y = "Genes detected") + ggtitle(NULL)
+
+p_qc <- p_umi / p_genes
+ggsave(paste0(out_dir, "ed5a_qc_violins.pdf"), plot = p_qc, h = 6, w = 10)
+```
+
+## Panel f — Cell composition by genotype × diet
+
+```{r composition, fig.width=10, fig.height=4}
+p_comp <- arc_glp1rko_labeled[[]] %>%
+    count(predicted.celltype, geno, diet) %>%
+    ggplot(aes(x = predicted.celltype, y = n, fill = interaction(geno, diet))) +
+    geom_col(position = "dodge", color = "white", linewidth = 0.1) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 5)) +
+    labs(x = NULL, y = "Number of cells", fill = "Geno.Diet")
+ggsave(paste0(out_dir, "ed5a_composition.pdf"), plot = p_comp, h = 4, w = 10)
+```
+
+## Panel g — Mapping confidence
+
+```{r mapping_score}
+p_score <- FeaturePlot(arc_glp1rko_labeled, reduction = "ref.umap", features = "predicted.celltype.score",
+                       order = TRUE) +
+    scale_color_viridis_c() +
+    theme_void() + coord_equal() + ggtitle("Mapping confidence")
+ggsave(paste0(out_dir, "ed5a_mapping_score.pdf"), plot = p_score, h = 4, w = 5)
+```

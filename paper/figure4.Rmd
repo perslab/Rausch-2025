@@ -1,0 +1,409 @@
+---
+title: "Figure 4 — Direct leptin action on Lepr/Glp1r neurons determines diet response"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r setup_libraries_data}
+library(Seurat)
+library(tidyverse)
+library(targets)
+library(edgeR)
+library(limma)
+library(lme4)
+library(emmeans)
+library(ggrepel)
+library(patchwork)
+library(magrittr)
+library(MASS)
+library(janitor)
+
+source(here::here("R/basic_processing.R"))
+source(here::here("R/analysis_wrappers.R"))
+source(here::here("R/helper_functions.R"))
+
+fig_path_4 <- here::here("output_figures/paper/figure4/")
+tab_path_4 <- here::here("output_figures/paper/figure4/tables/")
+dir.create(fig_path_4, recursive = TRUE, showWarnings = FALSE)
+dir.create(tab_path_4, recursive = TRUE, showWarnings = FALSE)
+
+# Global base font size — change here to update all panels
+BASE_SIZE <- 8
+geno_cols  <- c("mut" = "#C0392B", "wt" = "grey70")
+
+# Leptin gene signature
+# LGS genes derived from MINT sPLS-DA (see paper/lgs.Rmd)
+lgs_genes <- read.csv(here::here("output_figures/paper/lgs/lgs_genes.csv"))
+leptin_geneset <- lgs_genes$gene[lgs_genes$value.var < 0]
+
+# Load only what Figure 4 core panels need
+targets::tar_config_set(store = here::here("_targets"))
+targets::tar_load(arc_diet_labeled)
+targets::tar_load(arc_glp1rko_labeled)
+targets::tar_load(pb_glp1rko)
+targets::tar_load(celltypes_glp1rko)
+names(pb_glp1rko) <- celltypes_glp1rko
+```
+
+## Identify Lepr-expressing clusters from diet reference
+
+```{r lepr_clusters}
+DefaultAssay(arc_diet_labeled) <- "RNA"
+lepr_exp <- AverageExpression(arc_diet_labeled, features = "Lepr", group.by = "seurat_clusters")
+lepclus  <- names(as.data.frame(lepr_exp$RNA))[which(lepr_exp$RNA > 1)]
+lepclus  <- lepclus[-5]   # remove low-quality cluster, consistent with figure2
+```
+
+## Figure 4e — LGS across Lepr+ cell types: GLP1R/Lepr-KO
+
+```{r panel_4e_lgs_glp1rko}
+# Compute LGS scores in GLP1R-KO dataset
+DefaultAssay(arc_glp1rko_labeled) <- "RNA"
+arc_glp1rko_labeled@meta.data <- arc_glp1rko_labeled@meta.data[,
+    !grepl("Cluster", colnames(arc_glp1rko_labeled@meta.data))]
+arc_glp1rko_labeled <- AddModuleScore(arc_glp1rko_labeled, features = list(leptin_geneset))
+
+# Pseudobulk LGS per animal × cell type — all Lepr+ clusters
+gko_pb <- arc_glp1rko_labeled[[]] %>%
+    dplyr::select(geno, diet, predicted.celltype, hash.mcl.ID, hash_pool, sex, starts_with("Cluster")) %>%
+    filter(predicted.celltype %in% lepclus) %>%
+    group_by(geno, diet, predicted.celltype, hash.mcl.ID, hash_pool, sex) %>%
+    summarise(mean_lgs = mean(Cluster1), .groups = "drop") %>%
+    mutate(geno = factor(geno, c("wt", "mut")),
+           diet = factor(diet, c("Chow", "DIO")))
+
+# Per-cell-type model: WT - KO emmeans contrasts by diet
+gko_res <- gko_pb %>%
+    nest(data = -predicted.celltype) %>%
+    mutate(mod = purrr::map(data, ~lm(mean_lgs ~ geno * diet + sex, data = .x)),
+           emm = purrr::map(mod, ~emmeans::emmeans(.x, pairwise ~ geno | diet)$contrasts %>% data.frame())) %>%
+    dplyr::select(predicted.celltype, emm) %>%
+    unnest(emm) %>%
+    mutate(padj = p.adjust(p.value, "BH")) %>%
+    dplyr::rename(ct = predicted.celltype)
+
+write_csv(gko_res, paste0(tab_path_4, "lgs_glp1rko_per_cluster_stats.csv"))
+
+# Overall model on Lepr/Glp1r neurons (cluster 12) — report beta and interaction p
+clus12_pb    <- gko_pb %>% filter(predicted.celltype == "12")
+mod_overall  <- lm(mean_lgs ~ geno * diet + sex, data = clus12_pb)
+beta_geno    <- coef(summary(mod_overall))["genomut", "Estimate"]
+p_geno       <- coef(summary(mod_overall))["genomut", "Pr(>|t|)"]
+p_interaction <- summary(mod_overall)$coefficients["genomut:dietDIO", "Pr(>|t|)"]
+cat(sprintf("Lepr/Glp1r neurons — geno effect: beta=%.3f, p=%.2e\n", beta_geno, p_geno))
+cat(sprintf("Genotype x diet interaction: p=%.2e\n", p_interaction))
+
+p_lgs_glp1rko_clusters <- gko_res %>%
+    ggplot() +
+    geom_errorbar(aes(y = ct, x = estimate,
+                      xmin = estimate - SE * 1.96, xmax = estimate + SE * 1.96,
+                      color = diet), width = 0, position = position_dodge(width = 0.5), linewidth = 0.6) +
+    geom_point(shape = 21, stroke = 0.8, size = 2.5,
+               aes(y = ct, x = estimate, fill = diet,
+                   color = I(ifelse(padj < 0.05, "black", "grey60"))),
+               position = position_dodge(width = 0.5)) +
+    geom_vline(xintercept = 0, lty = 2, linewidth = 0.4, color = "grey40") +
+    scale_fill_manual(values  = c("DIO" = "#E8682F", "Chow" = "#F0AD74")) +
+    scale_color_manual(values = c("DIO" = "#E8682F", "Chow" = "#F0AD74")) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    cowplot::panel_border() +
+    labs(x = "WT - KO LGS (estimated difference)", y = NULL, fill = "Diet", color = "Diet")
+
+ggsave(paste0(fig_path_4, "figure4e_lgs_glp1rko_clusters.pdf"),
+       plot = p_lgs_glp1rko_clusters, h = 4, w = 4)
+```
+
+## Figure 4f — PCA: GLP1R/Lepr-KO cluster 12 projected onto diet PCA space
+
+```{r panel_4f_pca_glp1rko}
+# Project Lepr/Glp1r (cluster 12) KO cells onto reference diet PCA
+ref_data <- subset(arc_diet_labeled, subset = treatment %in% c("HFD", "Chow", "Fast"))
+celltype <- "12"
+
+ref_subset   <- subset(ref_data, subset = seurat_clusters == celltype)
+new_subset   <- subset(arc_glp1rko_labeled, subset = predicted.celltype == celltype)
+shared_feats <- intersect(rownames(ref_subset), rownames(new_subset))
+
+ref_subset <- process_seurat(subset(ref_subset, features = shared_feats),
+                              method = "integrate", batch = "hash_pool",
+                              cluster = FALSE, nfeats = 5000)
+ref_mat       <- ref_subset@assays$integrated@scale.data
+ref_pca       <- prcomp(t(ref_mat), center = TRUE, scale. = FALSE)
+
+new_subset    <- NormalizeData(new_subset) %>% ScaleData(features = VariableFeatures(ref_subset))
+scale_mat     <- new_subset@assays$RNA@scale.data
+scale_mat     <- scale_mat[match(rownames(ref_mat), rownames(scale_mat)), ]
+new_pca_scores <- as.matrix(t(scale_mat)) %*% ref_pca$rotation %>% data.frame()
+
+diet_pca_cols <- c("HFD" = "#E8682F", "Chow" = "#F0AD74", "Fast" = "#165C5B")
+geno_cols <- c("Control" = "#4A90D9", "Glp1rLepr-KO" = "#C0392B")
+
+# Helper: plot DIO KO vs WT on colored reference background + permutation test
+plot_pca_dio_shift <- function(ref_bg_df, ko_pts_df, title_label, n_perm = 1000) {
+    ko_dio <- ko_pts_df %>% filter(diet == "HFD")
+
+    # Permutation test: is the PC1 shift between genotypes significant?
+    obs_diff <- abs(diff(tapply(ko_dio$PC1, ko_dio$geno, mean)))
+    perm_diffs <- replicate(n_perm, {
+        shuf <- sample(ko_dio$geno)
+        abs(diff(tapply(ko_dio$PC1, shuf, mean)))
+    })
+    perm_p <- (sum(perm_diffs >= obs_diff) + 1) / (n_perm + 1)
+    cat(title_label, "- PC1 shift permutation test: obs_diff =", round(obs_diff, 3),
+        ", p =", round(perm_p, 4), "\n")
+
+    # Compute centroids for Fast and HFD reference groups
+    ref_centroids <- ref_bg_df %>%
+        filter(diet %in% c("Fast", "HFD")) %>%
+        group_by(diet) %>%
+        summarise(PC1 = mean(PC1), PC2 = mean(PC2), .groups = "drop")
+
+    p <- ggplot() +
+        geom_point(data = ref_bg_df, aes(PC1, PC2, color = diet), size = 0.3, alpha = 0.15) +
+        scale_color_manual(values = diet_pca_cols, guide = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+        ggnewscale::new_scale_color() +
+        geom_point(data = ko_dio, aes(PC1, PC2, color = geno), size = 0.8, alpha = 0.6) +
+        scale_color_manual(values = geno_cols, guide = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+        annotate("point", x = ref_centroids$PC1, y = ref_centroids$PC2,
+                 shape = 4, size = 5, stroke = 2, color = diet_pca_cols[ref_centroids$diet]) +
+        cowplot::theme_cowplot(font_size = BASE_SIZE) +
+        labs(x = "PC1", y = "PC2", title = title_label)
+
+    return(list(plot = p, perm_p = perm_p, obs_diff = obs_diff))
+}
+
+# Reference background and KO points for Lepr/Glp1r
+ref_bg <- data.frame(ref_pca$x[, 1:2], diet = ref_subset@meta.data[["treatment"]])
+ko_pts <- new_pca_scores[, 1:2] %>%
+    bind_cols(new_subset[[]] %>% dplyr::select(geno, diet)) %>%
+    mutate(diet = ifelse(diet == "DIO", "HFD", diet),
+           geno = factor(geno, c("wt", "mut"),
+                         labels = c("Control", "Glp1rLepr-KO")))
+
+set.seed(42)
+res_glp1r <- plot_pca_dio_shift(ref_bg, ko_pts, "Lepr/Glp1r neurons (DIO)")
+
+ggsave(paste0(fig_path_4, "figure4f_pca_glp1rko.pdf"), plot = res_glp1r$plot, h = 4, w = 5)
+```
+
+## Figure 4f2 — PCA: GLP1R/Lepr-KO AgRP neurons projected onto diet PCA space
+
+```{r panel_4f2_pca_agrp}
+# Project AgRP KO cells onto reference diet PCA (same approach as Lepr/Glp1r above)
+celltype_agrp <- "Agrp"
+
+ref_subset_agrp <- subset(ref_data, subset = seurat_clusters == celltype_agrp)
+new_subset_agrp <- subset(arc_glp1rko_labeled, subset = predicted.celltype == celltype_agrp)
+shared_feats_agrp <- intersect(rownames(ref_subset_agrp), rownames(new_subset_agrp))
+
+ref_subset_agrp <- process_seurat(subset(ref_subset_agrp, features = shared_feats_agrp),
+                                   method = "integrate", batch = "hash_pool",
+                                   cluster = FALSE, nfeats = 5000)
+ref_mat_agrp       <- ref_subset_agrp@assays$integrated@scale.data
+ref_pca_agrp       <- prcomp(t(ref_mat_agrp), center = TRUE, scale. = FALSE)
+
+new_subset_agrp    <- NormalizeData(new_subset_agrp) %>% ScaleData(features = VariableFeatures(ref_subset_agrp))
+scale_mat_agrp     <- new_subset_agrp@assays$RNA@scale.data
+scale_mat_agrp     <- scale_mat_agrp[match(rownames(ref_mat_agrp), rownames(scale_mat_agrp)), ]
+new_pca_agrp       <- as.matrix(t(scale_mat_agrp)) %*% ref_pca_agrp$rotation %>% data.frame()
+
+ref_bg_agrp <- data.frame(ref_pca_agrp$x[, 1:2], diet = ref_subset_agrp@meta.data[["treatment"]])
+ko_pts_agrp <- new_pca_agrp[, 1:2] %>%
+    bind_cols(new_subset_agrp[[]] %>% dplyr::select(geno, diet)) %>%
+    mutate(diet = ifelse(diet == "DIO", "HFD", diet),
+           geno = factor(geno, c("wt", "mut"),
+                         labels = c("Control", "Glp1rLepr-KO")))
+
+res_agrp <- plot_pca_dio_shift(ref_bg_agrp, ko_pts_agrp, "AgRP neurons (DIO)")
+
+ggsave(paste0(fig_path_4, "figure4f2_pca_agrp.pdf"), plot = res_agrp$plot, h = 4, w = 5)
+```
+
+## Figure 4g–h — DE volcano: GLP1R/Lepr-KO vs WT in Lepr/Glp1r neurons (Chow and DIO)
+
+```{r panel_4g_h_volcano_glp1rko}
+pbd <- pb_glp1rko[["12"]]
+pbd$samples$group <- interaction(pbd$samples$geno, pbd$samples$diet)
+design <- model.matrix(~ 0 + group + sex, data = pbd$samples)
+colnames(design) <- gsub(":", "_", colnames(design))
+
+fitd <- voomLmFit(pbd, design)
+contrast.matrix <- makeContrasts(
+    DIO  = groupmut.DIO  - groupwt.DIO,
+    Chow = groupmut.Chow - groupwt.Chow,
+    levels = design
+)
+fit2 <- contrasts.fit(fitd, contrast.matrix)
+fit2 <- eBayes(fit2, robust = FALSE)
+
+glp12_chow_degs <- topTable(fit2, n = Inf, coef = "Chow") %>% mutate(sig = adj.P.Val < 0.05)
+glp12_dio_degs  <- topTable(fit2, n = Inf, coef = "DIO")  %>% mutate(sig = adj.P.Val < 0.05)
+
+cat("Chow DEGs (FDR<0.05):", sum(glp12_chow_degs$sig), "\n")
+cat("DIO  DEGs (FDR<0.05):", sum(glp12_dio_degs$sig),  "\n")
+
+write_csv(glp12_chow_degs, paste0(tab_path_4, "glp1rko_clus12_chow_degs.csv"))
+write_csv(glp12_dio_degs,  paste0(tab_path_4, "glp1rko_clus12_dio_degs.csv"))
+
+# Genes the manuscript explicitly names on the DIO volcano
+force_label_dio <- c("Fos", "Vgf", "Homer1",
+                     "Gabra3", "Gabra4", "Gabra5", "Gabrb1", "Gabrb2", "Gabrb3")
+
+volc_glp12_dat <- bind_rows(
+    glp12_chow_degs %>% mutate(comparison = "Chow"),
+    glp12_dio_degs  %>% mutate(comparison = "DIO")
+)
+
+# Top-10 by FDR per panel, plus forced manuscript genes on DIO panel
+volc_glp12_labs <- bind_rows(
+    volc_glp12_dat %>% filter(sig) %>%
+        group_by(comparison) %>% slice_min(adj.P.Val, n = 10) %>% ungroup(),
+    volc_glp12_dat %>% filter(comparison == "DIO", gene %in% force_label_dio)
+) %>% distinct(comparison, gene, .keep_all = TRUE)
+
+p_volc_glp12 <- volc_glp12_dat %>%
+    ggplot(aes(logFC, -log10(adj.P.Val))) +
+    geom_point(aes(color = I(ifelse(sig, "#2C3E50", "grey80"))), alpha=0.5, shape = 16, size = 0.6) +
+    ggrepel::geom_text_repel(data = volc_glp12_labs, aes(label = gene), color="red",fontface = "bold",
+                              size = 3, max.overlaps = 15, min.segment.length = 0,
+                              segment.size = 0.3, show.legend = FALSE) +
+    geom_hline(yintercept = -log10(0.05), lty = 2, linewidth = 0.3, color = "grey50") +
+    facet_wrap(~ comparison, nrow = 1, scales="free_x") +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    cowplot::panel_border() +
+    theme(strip.background = element_blank()) +
+    labs(x = "log2FC (KO - WT)", y = "-log10(adj. p-value)")
+
+ggsave(paste0(fig_path_4, "figure4g_h_volcano_glp1rko_clus12.pdf"), plot = p_volc_glp12, h = 5, w = 12)
+```
+
+## Figure 4i — AgRP neurons in DIO KO adopt fasting-like transcriptional state
+
+```{r panel_4i_volcano_agrp_fasting}
+# Diet-regulated genes in AgRP neurons — split fasting into directional sets
+# comp: "hvc" = HFD vs Chow, "fvc" = Fast vs Chow
+diet_pairwise <- read.csv(here::here("results/diet_pairwise_deg.csv"))
+
+fast_up   <- diet_pairwise %>%
+    filter(ct == "Agrp", comp == "fvc", adj.P.Val < 0.05, logFC > 1) %>% pull(gene)
+fast_down <- diet_pairwise %>%
+    filter(ct == "Agrp", comp == "fvc", adj.P.Val < 0.05, logFC < -1) %>% pull(gene)
+hfd_sig   <- diet_pairwise %>%
+    filter(ct == "Agrp", comp == "hvc", adj.P.Val < 0.05) %>% pull(gene)
+
+cat("Fasting-upregulated AgRP genes (|logFC|>1):", length(fast_up), "\n")
+cat("Fasting-downregulated AgRP genes (|logFC|>1):", length(fast_down), "\n")
+cat("HFD-regulated AgRP genes:", length(hfd_sig), "\n")
+
+# GLP1R/Lepr-KO vs WT in AgRP neurons — DIO only
+pbd_av <- pb_glp1rko[["Agrp"]]
+pbd_av$samples$group <- interaction(pbd_av$samples$geno, pbd_av$samples$diet)
+design_av <- model.matrix(~ 0 + group + sex, data = pbd_av$samples)
+colnames(design_av) <- gsub(":", "_", colnames(design_av))
+
+fit2_av <- contrasts.fit(
+    voomLmFit(pbd_av, design_av),
+    makeContrasts(DIO = groupmut.DIO - groupwt.DIO, levels = design_av)
+) %>% eBayes(robust = FALSE)
+
+dio_av <- topTable(fit2_av, n = Inf, coef = "DIO") %>%
+    mutate(
+        # Only highlight fasting-regulated genes; HFD genes uncolored
+        diet_group = case_when(
+            gene %in% fast_up   ~ "Fasting up",
+            gene %in% fast_down ~ "Fasting dn",
+            TRUE                ~ "Neither"
+        ),
+        diet_group = factor(diet_group, c("Fasting up", "Fasting dn", "Neither"))
+    )
+
+write_csv(dio_av, paste0(tab_path_4, "glp1rko_agrp_dio_diet_annotated.csv"))
+cat("KO DIO genes by diet annotation:\n")
+print(count(dio_av, diet_group))
+
+diet_volc_cols <- c("Fasting up" = "#E07B39", "Fasting dn" = "#2E86AB", "Neither" = "grey80")
+
+# Label only KO-significant fasting-concordant genes — HFD genes NOT labeled
+diet_volc_labs <- dio_av %>%
+    filter(adj.P.Val < 0.05) %>%
+    filter((logFC > 0 & diet_group == "Fasting up") |
+           (logFC < 0 & diet_group == "Fasting dn"))
+
+p_volc_diet <- dio_av %>%
+    arrange(desc(diet_group == "Neither")) %>%
+    ggplot(aes(logFC, -log10(adj.P.Val), color = diet_group)) +
+    geom_point(aes(size  = diet_group != "Neither",
+                   alpha = diet_group != "Neither"), shape = 16) +
+    scale_size_manual(values  = c("TRUE" = 1.2, "FALSE" = 0.4), guide = "none") +
+    scale_alpha_manual(values = c("TRUE" = 0.85, "FALSE" = 0.2), guide = "none") +
+    scale_color_manual(values = diet_volc_cols) +
+    ggrepel::geom_text_repel(data = diet_volc_labs, aes(label = ifelse(adj.P.Val<5e-3, gene, NA_character_)),
+                              size = 2, max.overlaps = 15, min.segment.length = 0,
+                              segment.size = 0.3, show.legend = FALSE) +
+    geom_hline(yintercept = -log10(0.05), lty = 2, color = "grey50", linewidth = 0.3) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(legend.position = "right") +
+    labs(x = "log2FC (KO - WT, DIO)", y = "-log10(adj. p-value)",
+         color = "Fasting response\n(AgRP neurons)")
+
+ggsave(paste0(fig_path_4, "figure4i_volcano_agrp_fasting.pdf"), plot = p_volc_diet, h = 5, w = 4)
+
+# --- Directional enrichment: KO in DIO recapitulates the fasting transcriptome ---
+ko_up   <- dio_av %>% filter(adj.P.Val < 0.05, logFC > 0) %>% pull(gene)
+ko_down <- dio_av %>% filter(adj.P.Val < 0.05, logFC < 0) %>% pull(gene)
+bg      <- dio_av$gene
+
+ft1 <- fisher.test(
+    matrix(c(sum(bg %in% ko_up  &  bg %in% fast_up),
+              sum(bg %in% ko_up  & !bg %in% fast_up),
+              sum(!bg %in% ko_up &  bg %in% fast_up),
+              sum(!bg %in% ko_up & !bg %in% fast_up)), nrow = 2),
+    alternative = "greater")
+cat("Fasting up intersect KO-upregulated (DIO):\n")
+cat("  n =", sum(bg %in% ko_up & bg %in% fast_up),
+    " OR =", round(ft1$estimate, 2), " p =", signif(ft1$p.value, 3), "\n\n")
+
+ft2 <- fisher.test(
+    matrix(c(sum(bg %in% ko_down  &  bg %in% fast_down),
+              sum(bg %in% ko_down  & !bg %in% fast_down),
+              sum(!bg %in% ko_down &  bg %in% fast_down),
+              sum(!bg %in% ko_down & !bg %in% fast_down)), nrow = 2),
+    alternative = "greater")
+cat("Fasting dn intersect KO-downregulated (DIO):\n")
+cat("  n =", sum(bg %in% ko_down & bg %in% fast_down),
+    " OR =", round(ft2$estimate, 2), " p =", signif(ft2$p.value, 3), "\n")
+
+# DIO-only volcano for Lepr/Glp1r (extract from full data)
+p_volc_glp12_dio <- volc_glp12_dat %>%
+    filter(comparison == "DIO") %>%
+    ggplot(aes(logFC, -log10(adj.P.Val))) +
+    geom_point(aes(color = I(ifelse(sig, "#2C3E50", "grey80"))), alpha = 0.5, shape = 16, size = 0.6) +
+    ggrepel::geom_text_repel(
+        data = volc_glp12_labs %>% filter(comparison == "DIO"),
+        aes(label = gene), color = "red", fontface = "bold",
+        size = 2, max.overlaps = 15, min.segment.length = 0,
+        segment.size = 0.3, show.legend = FALSE) +
+    geom_hline(yintercept = -log10(0.05), lty = 2, linewidth = 0.3, color = "grey50") +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    labs(x = "log2FC (KO - WT, DIO)", y = "-log10(adj. p-value)", title = "Lepr/Glp1r neurons (DIO)")
+
+# Composite: 2 rows × 2 cols
+# Top:    Lepr/Glp1r PCA  |  Lepr/Glp1r DIO volcano
+# Bottom: AgRP PCA        |  AgRP DIO fasting volcano
+p_composite <- (res_glp1r$plot + p_volc_glp12_dio) /
+               (res_agrp$plot + p_volc_diet) +
+    patchwork::plot_annotation(tag_levels = "a") &
+    theme(plot.tag = element_text(face = "bold", size = 10))
+
+ggsave(paste0(fig_path_4, "figure4_pca_volcano_composite.pdf"),
+       plot = p_composite, h = 5, w = 14)
+
+# Save individual plot objects
+saveRDS(p_lgs_glp1rko_clusters, paste0(fig_path_4, "p_fig4e.rds"))
+saveRDS(res_glp1r$plot,          paste0(fig_path_4, "p_fig4f.rds"))
+saveRDS(p_volc_glp12,           paste0(fig_path_4, "p_fig4gh.rds"))
+saveRDS(p_volc_diet,            paste0(fig_path_4, "p_fig4i.rds"))
+```

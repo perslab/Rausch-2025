@@ -1,0 +1,381 @@
+---
+title: "Supplementary Figure 4 — GLP1R/Lepr-KO and AgRP-KO supporting analyses"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r setup_libraries_data}
+library(Seurat)
+library(tidyverse)
+library(targets)
+library(edgeR)
+library(limma)
+library(lme4)
+library(emmeans)
+library(ggrepel)
+library(ggridges)
+library(patchwork)
+library(magrittr)
+library(MASS)
+library(janitor)
+
+source(here::here("R/basic_processing.R"))
+source(here::here("R/analysis_wrappers.R"))
+source(here::here("R/helper_functions.R"))
+
+fig_path_s4 <- here::here("output_figures/paper/figure4/supp/")
+tab_path_s4 <- here::here("output_figures/paper/figure4/supp/tables/")
+dir.create(fig_path_s4, recursive = TRUE, showWarnings = FALSE)
+dir.create(tab_path_s4, recursive = TRUE, showWarnings = FALSE)
+
+BASE_SIZE <- 8
+geno_cols <- c("mut" = "#C0392B", "wt" = "grey70")
+diet_cols <- c("DIO" = "#E8682F", "Chow" = "#F0AD74", "Fast" = "#165C5B")
+
+# LGS genes derived from MINT sPLS-DA (see paper/lgs.Rmd)
+lgs_genes <- read.csv(here::here("output_figures/paper/lgs/lgs_genes.csv"))
+leptin_geneset <- lgs_genes$gene[lgs_genes$value.var < 0]
+
+targets::tar_config_set(store = here::here("_targets"))
+targets::tar_load(arc_diet_labeled)
+targets::tar_load(arc_agrpko_labeled)
+targets::tar_load(arc_glp1rko_labeled)
+targets::tar_load(agrpko_celldist)
+targets::tar_load(glp1rko_celldist)
+targets::tar_load(pb_glp1rko)
+targets::tar_load(celltypes_glp1rko)
+names(pb_glp1rko) <- celltypes_glp1rko
+targets::tar_load(pb_agrpko)
+targets::tar_load(celltypes_agrpko)
+names(pb_agrpko) <- celltypes_agrpko
+
+DefaultAssay(arc_diet_labeled) <- "RNA"
+lepr_exp <- AverageExpression(arc_diet_labeled, features = "Lepr", group.by = "seurat_clusters")
+lepclus  <- names(as.data.frame(lepr_exp$RNA))[which(lepr_exp$RNA > 1)]
+lepclus  <- lepclus[-5]
+```
+
+## Extended Data 5a — UMAPs of KO animals by cell type and genotype
+
+```{r supp_umaps}
+agrpko_umap <- DimPlot(arc_agrpko_labeled, group.by = "predicted.celltype",
+                       shuffle = TRUE, raster = TRUE, reduction = "ref.umap",
+                       label = TRUE, label.size = 2.5) +
+    theme_void() + NoLegend() + theme(plot.title = element_blank())
+
+agrpko_geno <- DimPlot(arc_agrpko_labeled, group.by = "geno", cols = geno_cols,
+                       raster = TRUE, shuffle = TRUE, reduction = "ref.umap") +
+    theme_void() + theme(plot.title = element_blank(),
+                         legend.text = element_text(size = BASE_SIZE))
+
+glp1rko_umap <- DimPlot(arc_glp1rko_labeled, group.by = "predicted.celltype",
+                        shuffle = TRUE, raster = TRUE, reduction = "ref.umap",
+                        label = TRUE, label.size = 2.5) +
+    theme_void() + NoLegend() + theme(plot.title = element_blank())
+
+glp1rko_geno <- DimPlot(arc_glp1rko_labeled, group.by = "geno", cols = geno_cols,
+                        raster = TRUE, shuffle = TRUE, reduction = "ref.umap") +
+    theme_void() + theme(plot.title = element_blank(),
+                         legend.text = element_text(size = BASE_SIZE))
+
+(agrpko_umap + glp1rko_umap) / (agrpko_geno + glp1rko_geno)
+ggsave(paste0(fig_path_s4, "suppfig4_ko_umaps.pdf"), h = 8, w = 12)
+```
+
+## Supp — LGS in AgRP neurons (AgRP-KO dataset)
+
+```{r supp_lgs_agrpko}
+DefaultAssay(arc_agrpko_labeled) <- "RNA"
+arc_agrpko_labeled@meta.data <- arc_agrpko_labeled@meta.data[,
+    !grepl("Cluster", colnames(arc_agrpko_labeled@meta.data))]
+arc_agrpko_labeled <- AddModuleScore(arc_agrpko_labeled, features = list(leptin_geneset))
+
+lgs_agrpko <- arc_agrpko_labeled[[]] %>%
+    dplyr::select(geno, diet, predicted.celltype, hash.mcl.ID, hash_pool, sex, starts_with("Cluster")) %>%
+    filter(predicted.celltype == "Agrp") %>%
+    group_by(geno, diet, hash.mcl.ID, hash_pool, sex) %>%
+    summarise(mean_lgs = mean(Cluster1), .groups = "drop") %>%
+    mutate(geno = factor(geno, c("wt", "mut")),
+           diet = factor(diet, c("Chow", "DIO")))
+
+mod_agrpko_lgs <- lm(mean_lgs ~ geno * diet + sex, data = lgs_agrpko)
+emm_agrpko_lgs <- emmeans::emmeans(mod_agrpko_lgs, pairwise ~ geno | diet)$contrasts %>%
+    data.frame() %>% mutate(padj = p.adjust(p.value, "BH"))
+write_csv(emm_agrpko_lgs, paste0(tab_path_s4, "lgs_agrpko_stats.csv"))
+
+p_lgs_agrpko <- ggplot(lgs_agrpko, aes(geno, mean_lgs, fill = geno)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6, linewidth = 0.35) +
+    geom_jitter(width = 0.15, size = 0.8, alpha = 0.5, shape = 16) +
+    facet_wrap(~ diet, nrow = 1) +
+    scale_fill_manual(values = geno_cols) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    cowplot::panel_border() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none", strip.background = element_blank()) +
+    labs(x = NULL, y = "Leptin gene signature")
+
+ggsave(paste0(fig_path_s4, "suppfig4_lgs_agrpko.pdf"), plot = p_lgs_agrpko, h = 3.5, w = 4)
+```
+
+## Supp — LGS in Lepr/Glp1r neurons (GLP1R-KO, cluster 12 only)
+
+```{r supp_lgs_glp1rko_clus12}
+DefaultAssay(arc_glp1rko_labeled) <- "RNA"
+arc_glp1rko_labeled@meta.data <- arc_glp1rko_labeled@meta.data[,
+    !grepl("Cluster", colnames(arc_glp1rko_labeled@meta.data))]
+arc_glp1rko_labeled <- AddModuleScore(arc_glp1rko_labeled, features = list(leptin_geneset))
+
+lgs_glp1rko <- arc_glp1rko_labeled[[]] %>%
+    dplyr::select(geno, diet, predicted.celltype, hash.mcl.ID, hash_pool, sex, starts_with("Cluster")) %>%
+    filter(predicted.celltype == "12") %>%
+    group_by(geno, diet, hash.mcl.ID, hash_pool, sex) %>%
+    summarise(mean_lgs = mean(Cluster1), .groups = "drop") %>%
+    mutate(geno = factor(geno, c("wt", "mut")),
+           diet = factor(diet, c("Chow", "DIO")))
+
+mod_glp1rko_lgs <- lm(mean_lgs ~ geno * diet + sex, data = lgs_glp1rko)
+emm_glp1rko_lgs <- emmeans::emmeans(mod_glp1rko_lgs, pairwise ~ geno | diet)$contrasts %>%
+    data.frame() %>% mutate(padj = p.adjust(p.value, "BH"))
+write_csv(emm_glp1rko_lgs, paste0(tab_path_s4, "lgs_glp1rko_clus12_stats.csv"))
+
+p_lgs_glp1rko <- ggplot(lgs_glp1rko, aes(geno, mean_lgs, fill = geno)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6, linewidth = 0.35) +
+    geom_jitter(width = 0.15, size = 0.8, alpha = 0.5, shape = 16) +
+    facet_wrap(~ diet, nrow = 1) +
+    scale_fill_manual(values = geno_cols) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    cowplot::panel_border() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none", strip.background = element_blank()) +
+    labs(x = NULL, y = "Leptin gene signature")
+
+ggsave(paste0(fig_path_s4, "suppfig4_lgs_glp1rko_clus12.pdf"), plot = p_lgs_glp1rko, h = 3.5, w = 4)
+```
+
+## Supp — scDist: KO vs WT cell distance by diet (DIO and Chow)
+
+```{r supp_scdist}
+glp1r_dat <- glp1rko_celldist$results %>%
+    janitor::clean_names() %>% rownames_to_column("group") %>%
+    separate(group, into = c("clus", "diet")) %>%
+    mutate(padj = p.adjust(p_val, "BH"), ko = "GLP1R/Lepr-KO")
+
+agrp_dat <- agrpko_celldist$results %>%
+    janitor::clean_names() %>% rownames_to_column("group") %>%
+    separate(group, into = c("clus", "diet")) %>%
+    mutate(padj = p.adjust(p_val, "BH"), ko = "AgRP-KO")
+
+make_scdist_scatter <- function(dat) {
+    dio_df  <- dat %>% filter(diet == "DIO")  %>%
+        dplyr::select(clus, dist, x95_percent_ci_low, x95_percent_ci_upper, padj)
+    chow_df <- dat %>% filter(diet == "Chow") %>%
+        dplyr::select(clus, dist, x95_percent_ci_low, x95_percent_ci_upper, padj)
+    merged  <- merge(dio_df, chow_df, by = "clus", suffixes = c("_dio", "_chow"))
+    merged %>%
+        mutate(sig = padj_dio < 0.05 | padj_chow < 0.05) %>%
+        ggplot(aes(dist_dio, dist_chow,
+                   color = I(case_when(
+                       padj_dio < 0.05 & padj_chow < 0.05  ~ "#C0392B",
+                       padj_dio < 0.05 & padj_chow >= 0.05 ~ "#2C3E50",
+                       TRUE ~ "grey80")))) +
+        geom_point(size = 2.5) +
+        geom_abline(lty = 2, linewidth = 0.4, color = "grey40") +
+        ggrepel::geom_text_repel(data = ~ filter(.x, sig), aes(label = clus),
+                                  size = 2, max.overlaps = 10,
+                                  min.segment.length = 0, segment.size = 0.3) +
+        cowplot::theme_cowplot(font_size = BASE_SIZE) +
+        labs(x = "KO-WT distance (DIO)", y = "KO-WT distance (Chow)")
+}
+
+p_glp1r_scdist <- make_scdist_scatter(glp1r_dat)
+p_agrp_scdist  <- make_scdist_scatter(agrp_dat)
+ggsave(paste0(fig_path_s4, "suppfig4_scdist_glp1rko.pdf"), plot = p_glp1r_scdist, h = 5, w = 5)
+ggsave(paste0(fig_path_s4, "suppfig4_scdist_agrpko.pdf"),  plot = p_agrp_scdist,  h = 5, w = 5)
+```
+
+## Supp — LDA projection: GLP1R-KO cells in diet transcriptional space
+
+```{r supp_lda_glp1rko}
+ref_data  <- subset(arc_diet_labeled, subset = treatment %in% c("HFD", "Chow", "Fast"))
+ref_subset_lda <- subset(ref_data, subset = seurat_clusters == "12")
+new_subset_lda <- subset(arc_glp1rko_labeled, subset = predicted.celltype == "12")
+shared_feats   <- intersect(rownames(ref_subset_lda), rownames(new_subset_lda))
+
+ref_subset_lda <- process_seurat(subset(ref_subset_lda, features = shared_feats),
+                                  method = "integrate", batch = "hash_pool",
+                                  cluster = FALSE, nfeats = 5000)
+ref_mat_lda  <- ref_subset_lda@assays$integrated@scale.data
+ref_pca_lda  <- prcomp(t(ref_mat_lda), center = TRUE, scale. = FALSE)
+lda_model    <- MASS::lda(ref_subset_lda$treatment ~ ., data = data.frame(ref_pca_lda$x)[, 1:10])
+
+new_subset_lda <- NormalizeData(new_subset_lda) %>% ScaleData(features = VariableFeatures(ref_subset_lda))
+scale_mat_lda  <- new_subset_lda@assays$RNA@scale.data
+scale_mat_lda  <- scale_mat_lda[match(rownames(ref_mat_lda), rownames(scale_mat_lda)), ]
+new_pca_lda    <- as.matrix(t(scale_mat_lda)) %*% ref_pca_lda$rotation %>% data.frame()
+lda_pred       <- predict(lda_model, new_pca_lda)$x
+
+p_ridge_glp1rko <- lda_pred %>%
+    bind_cols(new_subset_lda[[]] %>% dplyr::select(geno, diet)) %>%
+    mutate(geno = factor(geno, c("wt", "mut"))) %>%
+    ggplot(aes(LD1, y = geno, fill = geno)) +
+    ggridges::geom_density_ridges(alpha = 0.7, scale = 0.9, rel_min_height = 0.02) +
+    scale_fill_manual(values = geno_cols) +
+    facet_wrap(~ diet, nrow = 1) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    cowplot::panel_border() +
+    theme(legend.position = "none", strip.background = element_blank()) +
+    labs(x = "Diet transcriptional axis (LD1)", y = NULL)
+
+ggsave(paste0(fig_path_s4, "suppfig4_lda_glp1rko.pdf"), plot = p_ridge_glp1rko, h = 3, w = 7)
+```
+
+## Supp — LDA projection: AgRP-KO cells in diet transcriptional space
+
+```{r supp_lda_agrpko}
+ref_subset_ako <- subset(ref_data, subset = seurat_clusters == "Agrp")
+new_subset_ako <- subset(arc_agrpko_labeled, subset = predicted.celltype == "Agrp")
+shared_feats   <- intersect(rownames(ref_subset_ako), rownames(new_subset_ako))
+
+ref_subset_ako <- process_seurat(subset(ref_subset_ako, features = shared_feats),
+                                  method = "integrate", batch = "hash_pool",
+                                  cluster = FALSE, nfeats = 5000)
+ref_mat_ako  <- ref_subset_ako@assays$integrated@scale.data
+ref_pca_ako  <- prcomp(t(ref_mat_ako), center = FALSE, scale. = FALSE)
+lda_model_ako <- MASS::lda(ref_subset_ako$treatment ~ PC1 + PC2, data = data.frame(ref_pca_ako$x))
+
+new_subset_ako <- NormalizeData(new_subset_ako) %>% ScaleData(features = VariableFeatures(ref_subset_ako))
+scale_mat_ako  <- new_subset_ako@assays$RNA@scale.data
+scale_mat_ako  <- scale_mat_ako[match(rownames(ref_mat_ako), rownames(scale_mat_ako)), ]
+new_pca_ako    <- as.matrix(t(scale_mat_ako)) %*% ref_pca_ako$rotation %>% data.frame()
+lda_pred_ako   <- predict(lda_model_ako, new_pca_ako)$x
+
+p_ridge_agrpko <- lda_pred_ako %>%
+    bind_cols(new_subset_ako[[]] %>% dplyr::select(geno, diet)) %>%
+    mutate(geno = factor(geno, c("wt", "mut"))) %>%
+    ggplot(aes(LD1, y = geno, fill = geno)) +
+    ggridges::geom_density_ridges(alpha = 0.7, scale = 0.9, rel_min_height = 0.02) +
+    scale_fill_manual(values = geno_cols) +
+    facet_wrap(~ diet, nrow = 1) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    cowplot::panel_border() +
+    theme(legend.position = "none", strip.background = element_blank()) +
+    labs(x = "Diet transcriptional axis (LD1)", y = NULL)
+
+ggsave(paste0(fig_path_s4, "suppfig4_lda_agrpko.pdf"), plot = p_ridge_agrpko, h = 3, w = 7)
+```
+
+## Supp — DE volcano: GLP1R/Lepr-KO vs WT in AgRP neurons
+
+```{r supp_volcano_glp1rko_agrp}
+pbd <- pb_glp1rko[["Agrp"]]
+pbd$samples$group <- interaction(pbd$samples$geno, pbd$samples$diet)
+design <- model.matrix(~ 0 + group + sex, data = pbd$samples)
+colnames(design) <- gsub(":", "_", colnames(design))
+fit2 <- contrasts.fit(voomLmFit(pbd, design),
+             makeContrasts(DIO  = groupmut.DIO  - groupwt.DIO,
+                           Chow = groupmut.Chow - groupwt.Chow, levels = design)) %>%
+    eBayes(robust = FALSE)
+
+glpagrp_chow <- topTable(fit2, n = Inf, coef = "Chow") %>% mutate(sig = adj.P.Val < 0.05)
+glpagrp_dio  <- topTable(fit2, n = Inf, coef = "DIO")  %>% mutate(sig = adj.P.Val < 0.05)
+write_csv(glpagrp_chow, paste0(tab_path_s4, "glp1rko_agrp_chow_degs.csv"))
+write_csv(glpagrp_dio,  paste0(tab_path_s4, "glp1rko_agrp_dio_degs.csv"))
+
+volc_dat  <- bind_rows(glpagrp_chow %>% mutate(comparison = "Chow"),
+                       glpagrp_dio  %>% mutate(comparison = "DIO"))
+volc_labs <- volc_dat %>% filter(sig) %>% group_by(comparison) %>%
+    slice_min(adj.P.Val, n = 10) %>% ungroup()
+
+p_volc <- volc_dat %>%
+    ggplot(aes(logFC, -log10(adj.P.Val))) +
+    geom_point(aes(color = I(ifelse(sig, "#2C3E50", "grey80"))), shape = 16, size = 0.6) +
+    ggrepel::geom_text_repel(data = volc_labs, aes(label = gene), size = 2, max.overlaps = 10,
+                              min.segment.length = 0, segment.size = 0.3, show.legend = FALSE) +
+    geom_hline(yintercept = -log10(0.05), lty = 2, linewidth = 0.3, color = "grey50") +
+    facet_wrap(~ comparison, nrow = 1) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) + cowplot::panel_border() +
+    theme(strip.background = element_blank()) +
+    labs(x = "log2FC (KO - WT)", y = "-log10(adj. p-value)")
+ggsave(paste0(fig_path_s4, "suppfig4_volcano_glp1rko_agrp.pdf"), plot = p_volc, h = 5, w = 8)
+```
+
+## Supp — DE volcano: AgRP-KO vs WT in AgRP neurons
+
+```{r supp_volcano_agrpko_agrp}
+pbd <- pb_agrpko[["Agrp"]]
+pbd$samples$group <- interaction(pbd$samples$geno, pbd$samples$diet)
+design <- model.matrix(~ 0 + group + sex, data = pbd$samples)
+colnames(design) <- gsub(":", "_", colnames(design))
+fit2 <- contrasts.fit(voomLmFit(pbd, design),
+             makeContrasts(DIO  = groupmut.DIO  - groupwt.DIO,
+                           Chow = groupmut.Chow - groupwt.Chow, levels = design)) %>%
+    eBayes(robust = FALSE)
+
+agrpko_chow <- topTable(fit2, n = Inf, coef = "Chow") %>% mutate(sig = adj.P.Val < 0.05)
+agrpko_dio  <- topTable(fit2, n = Inf, coef = "DIO")  %>% mutate(sig = adj.P.Val < 0.05)
+write_csv(agrpko_chow, paste0(tab_path_s4, "agrpko_agrp_chow_degs.csv"))
+write_csv(agrpko_dio,  paste0(tab_path_s4, "agrpko_agrp_dio_degs.csv"))
+
+volc_dat  <- bind_rows(agrpko_chow %>% mutate(comparison = "Chow"),
+                       agrpko_dio  %>% mutate(comparison = "DIO"))
+volc_labs <- volc_dat %>% filter(sig) %>% group_by(comparison) %>%
+    slice_min(adj.P.Val, n = 10) %>% ungroup()
+
+p_volc <- volc_dat %>%
+    ggplot(aes(logFC, -log10(adj.P.Val))) +
+    geom_point(aes(color = I(ifelse(sig, "#2C3E50", "grey80"))), shape = 16, size = 0.6) +
+    ggrepel::geom_text_repel(data = volc_labs, aes(label = gene), size = 2, max.overlaps = 10,
+                              min.segment.length = 0, segment.size = 0.3, show.legend = FALSE) +
+    geom_hline(yintercept = -log10(0.05), lty = 2, linewidth = 0.3, color = "grey50") +
+    facet_wrap(~ comparison, nrow = 1) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) + cowplot::panel_border() +
+    theme(strip.background = element_blank()) +
+    labs(x = "log2FC (KO - WT)", y = "-log10(adj. p-value)")
+ggsave(paste0(fig_path_s4, "suppfig4_volcano_agrpko_agrp.pdf"), plot = p_volc, h = 5, w = 8)
+```
+
+## Supp — Diet gene set module scores in GLP1R-KO AgRP neurons
+
+```{r supp_diet_sets_agrp}
+diet_deg_sets <- read.csv(here::here("results/diet_pairwise_deg.csv"))
+
+get_top_bottom_n <- function(df, n = 50) {
+    total_rows <- nrow(df)
+    df %>% arrange(desc(t)) %>% dplyr::slice(c(1:n, (total_rows - n + 1):total_rows))
+}
+
+agrp_sets_df <- diet_deg_sets %>%
+    filter(ct == "Agrp") %>%
+    group_by(ct, comp) %>%
+    do(get_top_bottom_n(., 50)) %>%
+    ungroup() %>%
+    mutate(set_name = as.character(interaction(ct, comp, sign(logFC))))
+agrp_sets <- split(agrp_sets_df$gene, agrp_sets_df$set_name)
+
+agrp_glp1rko <- subset(arc_glp1rko_labeled, subset = predicted.celltype == "Agrp")
+agrp_glp1rko@meta.data <- agrp_glp1rko@meta.data[,
+    !grepl("Cluster", colnames(agrp_glp1rko@meta.data))]
+agrp_glp1rko <- AddModuleScore(agrp_glp1rko, features = agrp_sets, assay = "RNA")
+
+de_set_data <- agrp_glp1rko[[]] %>%
+    dplyr::select(geno, diet, hash.mcl.ID, starts_with("Cluster")) %>%
+    pivot_longer(starts_with("Cluster"), names_to = "cluster_idx", values_to = "score") %>%
+    group_by(geno, diet, hash.mcl.ID, cluster_idx) %>%
+    summarise(mean_score = mean(score), .groups = "drop") %>%
+    mutate(set_name = names(agrp_sets)[as.integer(gsub("Cluster", "", cluster_idx))],
+           geno = factor(geno, c("wt", "mut")),
+           diet = factor(diet, c("Chow", "DIO")))
+
+p_diet_sets <- ggplot(de_set_data, aes(x = set_name, y = mean_score, fill = geno)) +
+    geom_boxplot(outlier.shape = NA, linewidth = 0.35) +
+    facet_wrap(~ diet) +
+    scale_fill_manual(values = geno_cols) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          strip.background = element_blank()) +
+    labs(x = NULL, y = "Module score")
+ggsave(paste0(fig_path_s4, "suppfig4_diet_sets_glp1rko_agrp.pdf"), plot = p_diet_sets, h = 4, w = 7)
+```

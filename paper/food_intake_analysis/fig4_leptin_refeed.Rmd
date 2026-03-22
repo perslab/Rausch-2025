@@ -1,0 +1,246 @@
+---
+title: "Figure 4c–d: Leptin Requirement for Feeding Suppression"
+author: "Dylan Rausch"
+output: html_notebook
+---
+
+Tests whether leptin's ability to suppress feeding requires intact LepR signaling
+in Glp1r neurons. Compares WT vs Glp1rLepr-KO mice treated with leptin or saline.
+
+- **4c**: Fasting-refeeding with leptin/saline pretreatment
+- **4d**: Ghrelin-induced feeding with leptin pretreatment
+
+## Setup
+
+```{r setup, message=FALSE}
+library(tidyverse)
+library(lme4)
+library(car)
+library(emmeans)
+library(cowplot)
+library(patchwork)
+
+# -- Paths ---------------------------------------------------------------------
+feeding_file <- here::here("paper/food_intake_analysis/Agrp_Glp1R LepRflox Feeding_TP.DBR 05.2023.xlsx")
+out_dir <- here::here("output_figures/paper/extended_figures/ed_fig4_pheno")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -- Sample metadata -----------------------------------------------------------
+mice_data <- readxl::read_xlsx(feeding_file, sheet = 1) %>%
+  janitor::clean_names() %>%
+  dplyr::select(mouse, strain, genotype, sex)
+
+# -- Color palette -------------------------------------------------------------
+cols <- c("#56C1AF", "#155C5B")
+```
+
+## Figure 4c — Leptin + Fasting-Refeeding
+
+### Data Processing
+
+```{r process-lep-refeed}
+lep_refeed_data <- readxl::read_xlsx(feeding_file, sheet = 5) %>%
+  janitor::clean_names() %>%
+  arrange(mouse) %>%
+  mutate(datetime = as.POSIXct(paste(date, format(time, "%H:%M:%S")),
+                               format = "%Y-%m-%d %H:%M:%S")) %>%
+  # Leptin/saline experiments (exclude plain refeed experiments)
+  filter(!grepl("refeed", treatment)) %>%
+  mutate(trt = ifelse(grepl("Lep", treatment), "Lep", "Sal")) %>%
+  dplyr::select(-time) %>%
+  group_by(mouse, trt) %>%
+  mutate(
+    expstage = case_when(
+      row_number() < min(which(is.na(food))) ~ "baseline",
+      row_number() == min(which(is.na(food))) ~ "start-fast",
+      row_number() > min(which(is.na(food))) ~ "refeed"
+    ),
+    start_refeed = min(datetime[expstage == "refeed"]),
+    timefromrefeed = as.numeric(difftime(datetime, start_refeed, units = "hours")),
+    diet = ifelse(grepl("chow", treatment), "chow", "dio")
+  ) %>%
+  inner_join(mice_data, by = "mouse") %>%
+  group_by(mouse, expstage, strain, trt) %>%
+  mutate(
+    prev_intake = lag(food) - food,
+    cum_intake = cumsum(replace(prev_intake, is.na(prev_intake), 0)),
+    geno = ifelse(grepl("KO", genotype), "KO", "WT")
+  ) %>%
+  group_by(mouse, trt) %>%
+  mutate(
+    min = min(datetime),
+    timefromstart = difftime(datetime, min, units = "hours")
+  ) %>%
+  filter(!grepl("Agrp", strain)) %>%
+  # Baseline food intake: mean hourly intake over 20h pre-fast
+  dplyr::select(timefromrefeed, trt, mouse, bw, food, datetime, expstage,
+                geno, sex, prev_intake, cum_intake)
+```
+
+### Combined Model (Primary Analysis)
+
+**IMPORTANT:** The primary test is the `trt:geno` interaction in the combined
+model, NOT separate within-genotype p-values. This avoids the "difference
+between significant and not significant" fallacy (Nieuwenhuis et al., 2011).
+
+```{r model-4c-combined}
+# Log-time model: cumulative intake follows logarithmic time course
+lep_refeed_mod_data <- lep_refeed_data %>%
+  filter(timefromrefeed > 0, timefromrefeed < 26) %>%
+  mutate(log_time = log(timefromrefeed))
+
+mod_4c <- lmer(log1p(cum_intake) ~ log_time * trt * geno + sex + (1 | mouse),
+               data = lep_refeed_mod_data)
+
+# Primary result: trt:geno interaction
+car::Anova(mod_4c, type = "II")
+```
+
+### Post-hoc Contrasts
+
+```{r posthoc-4c}
+# Timepoint-specific contrasts use factor-time model (for plot annotations)
+mod_4c_fac <- lep_refeed_data %>%
+  filter(timefromrefeed > 0, timefromrefeed < 26) %>%
+  mutate(time = factor(timefromrefeed)) %>%
+  lmer(log1p(cum_intake) ~ time * trt * geno + sex + (1 | mouse), data = .)
+
+pval_lep_refeed <- emmeans(mod_4c_fac, ~ trt * time * geno) %>%
+  pairs(by = c("time", "geno"), adjust = "none") %>%
+  data.frame() %>%
+  filter(time != 0) %>%
+  mutate(adj = p.adjust(p.value, method = "BH"))
+
+pval_lep_refeed
+```
+
+### Plot
+
+```{r plot-4c-bars, fig.width=6, fig.height=3}
+# Bar plots at 4h and 24h timepoints
+ref4 <- lep_refeed_data %>%
+  mutate(group = interaction(geno, trt)) %>%
+  filter(timefromrefeed == 4) %>%
+  ggplot(aes(x = group, y = cum_intake, fill = trt)) +
+  stat_summary(geom = "bar", width = 0.8, color = "black") +
+  geom_line(aes(group = mouse), color = "grey90") +
+  geom_point() +
+  facet_wrap(vars(geno), scales = "free_x", strip.position = "bottom") +
+  labs(x = "Group", y = "Cumulative Intake (g)") +
+  cowplot::theme_cowplot(font_size = 8) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        strip.background = element_blank(),
+        panel.spacing = unit(0, units = "line"),
+        legend.position = "none") +
+  scale_fill_manual(values = cols) +
+  lims(y = c(0, 5))
+
+ref24 <- lep_refeed_data %>%
+  mutate(group = interaction(geno, trt)) %>%
+  filter(timefromrefeed == 24) %>%
+  ggplot(aes(x = group, y = cum_intake, fill = trt)) +
+  stat_summary(geom = "bar", width = 0.8, color = "black") +
+  geom_line(aes(group = mouse), color = "grey90") +
+  geom_point() +
+  facet_wrap(vars(geno), scales = "free_x", strip.position = "bottom") +
+  labs(x = "Group", y = "Cumulative Intake (g)") +
+  cowplot::theme_cowplot(font_size = 8) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        strip.background = element_blank(),
+        panel.spacing = unit(0, units = "line"),
+        legend.position = "none") +
+  scale_fill_manual(values = cols) +
+  lims(y = c(0, 10))
+
+ref4 + ref24
+ggsave(file.path(out_dir, "lep_refeed_bars.pdf"), h = 3, w = 6)
+```
+
+---
+
+## Figure 4d — Leptin + Ghrelin (1 mg/kg Leptin Pretreatment)
+
+```{r model-4d}
+lep_ghrelin_data <- readxl::read_xlsx(feeding_file, sheet = 7) %>%
+  janitor::clean_names() %>%
+  filter(grepl("Ghrelin \\(1mg", treatment), diet == "Chow") %>%
+  inner_join(mice_data, by = "mouse") %>%
+  arrange(mouse, treatment, date) %>%
+  mutate(
+    food = as.numeric(food),
+    geno = ifelse(grepl("KO", genotype), "KO", "WT"),
+    trt = ifelse(grepl("Leptin", treatment), "Lep+Ghrel", "Sal+Ghrel")
+  ) %>%
+  group_by(mouse, trt) %>%
+  mutate(
+    timefromfood = as.numeric(difftime(date, min(date), units = "hours")),
+    prev_intake = lag(food) - food,
+    cum_intake = cumsum(replace(prev_intake, is.na(prev_intake), 0))
+  ) %>%
+  filter(timefromfood == 24)
+
+fit_lep_ghrelin <- lmer(log1p(cum_intake) ~ geno * trt + (1 | mouse), data = lep_ghrelin_data)
+car::Anova(fit_lep_ghrelin)
+
+pval_lg <- emmeans(fit_lep_ghrelin, pairwise ~ trt | geno)$contrasts %>%
+  as.data.frame() %>%
+  mutate(adj = p.adjust(p.value, method = "BH"), label = case_when(adj < 0.001 ~ "***", adj < 0.01 ~ "**", adj < 0.05 ~ "*", TRUE ~ ""))
+pval_lg
+```
+
+### Plot
+
+```{r plot-4d, fig.width=4, fig.height=3.5}
+cols_trt <- c("Sal+Ghrel" = "#56C1AF", "Lep+Ghrel" = "#155C5B")
+
+bt_lg <- lep_ghrelin_data %>%
+  group_by(geno, trt) %>%
+  summarise(m = mean(cum_intake, na.rm = TRUE),
+            se = sd(cum_intake, na.rm = TRUE) / sqrt(n()), .groups = "drop") %>%
+  group_by(geno) %>%
+  summarise(top = max(m + se), .groups = "drop")
+
+sig_lg <- pval_lg %>%
+  left_join(bt_lg, by = "geno") %>%
+  mutate(y_brack = top * 1.12, y_text = top * 1.28) %>%
+  filter(label != "")
+
+p_lep_ghrelin <- lep_ghrelin_data %>%
+  ggplot(aes(x = trt, y = cum_intake, fill = trt)) +
+  stat_summary(geom = "bar", width = 0.8, color = "black", fun = mean) +
+  stat_summary(geom = "errorbar", width = 0.1, fun.data = mean_se) +
+  geom_line(aes(group = mouse), color = "grey80", linewidth = 0.4) +
+  geom_point(size = 0.8) +
+  facet_wrap(vars(geno), scales = "free_x", strip.position = "bottom") +
+  geom_segment(data = sig_lg,
+               aes(x = 1, xend = 2, y = y_brack, yend = y_brack),
+               inherit.aes = FALSE, linewidth = 0.3) +
+  geom_segment(data = sig_lg,
+               aes(x = 1, xend = 1, y = y_brack * 0.95, yend = y_brack),
+               inherit.aes = FALSE, linewidth = 0.3) +
+  geom_segment(data = sig_lg,
+               aes(x = 2, xend = 2, y = y_brack * 0.95, yend = y_brack),
+               inherit.aes = FALSE, linewidth = 0.3) +
+  geom_text(data = sig_lg, aes(x = 1.5, y = y_text, label = label),
+            inherit.aes = FALSE, size = 2.5) +
+  scale_fill_manual(values = cols_trt) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.35))) +
+  cowplot::theme_cowplot(font_size = 8) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        strip.background = element_blank(), panel.spacing = unit(0, "line"),
+        legend.position = "none") +
+  labs(x = NULL, y = "24 h food intake (g)")
+
+ggsave(file.path(out_dir, "lep_ghrelin.pdf"), plot = p_lep_ghrelin, h = 3.5, w = 4)
+```
+
+## Summary
+
+**Figure 4c** uses a combined model: `log1p(cum_intake) ~ log(time) * trt * geno + sex + (1|mouse)`.
+The primary result is the `trt:geno` interaction, which tests whether leptin's
+effect on refeeding differs between WT and KO. Post-hoc contrasts within each
+genotype are conditional on this interaction.
+
+**Figure 4d** uses: `log1p(cum_intake) ~ geno * treatment + (1|mouse)` at the
+24h timepoint. The `geno:treatment` interaction tests whether leptin's ability to
+blunt ghrelin-induced feeding differs by genotype.

@@ -1,0 +1,55 @@
+# R
+.Rproj.user
+*.Rhistory
+*.RData
+
+# Targets cache
+_targets/
+
+# Raw data (deposited in GEO)
+sc_preprocessing/
+h5_objects/
+external_data/
+
+# Rendered outputs
+*.html
+*.nb.html
+*.knit.md
+paper/*.html
+paper/food_intake_analysis/*.html
+paper/food_intake_analysis/*.nb.html
+
+# Data files (too large for git)
+*.h5
+*.h5ad
+*.qs
+*.RDS
+*.rds
+*.xlsx
+*.gz
+*.tar.gz
+
+# Output figures (regenerated from code)
+output_figures/
+
+# Misc
+SCENIC/
+MAGMA/
+CELLECT/
+ldsc/
+renv/
+renv_spatial/
+*.pdf
+*.tiff
+*.tif
+*.png
+*.jpg
+*.ai
+*.docx
+*.pptx
+*.zip
+slurm-*
+.vscode/
+.claude/
+git-lfs-*
+__pycache__/

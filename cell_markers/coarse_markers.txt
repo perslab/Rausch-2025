@@ -1,0 +1,38 @@
+>Neurons
+expressed: Rbfox3, Snap25
+not expressed: Cx3cr1, Ikzf1, Cga
+
+>Astrocytes
+expressed: Gfap, Aldh1l1, Aqp4, Bmpr1b, Fgfr3
+
+>Oligodendrocytes
+expressed: Opalin, Plp1
+not expressed: Rbfox3, Snap25
+
+>OPC
+expressed: Olig2, Olig1, Vcan, Gpr17
+not expressed: Rbfox3, Snap25
+
+>Endothelial_cells
+expressed: Cldn5, Ftl1, Pecam1
+not expressed: Rbfox3, Snap25
+
+>Microglia
+expressed: Cx3cr1, Ikzf1
+not expressed: Rbfox3, Snap25
+
+>Tanycytes
+expressed: Rax, Col23a1, Crym
+not expressed: Rbfox3, Snap25
+
+>VLMC
+expressed: Lum, Col1a1
+not expressed: Rbfox3, Snap25
+
+>Pericytes
+expressed: Pdgfrb
+not expressed: Col1a1
+
+>Ependymal_cells
+expressed: Foxj1, Pifo, Dynlrb2
+not expressed: Rbfox3, Snap25

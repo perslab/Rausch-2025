@@ -1,0 +1,325 @@
+---
+title: "Supplementary Figure — Leptin Gene Signature (LGS)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r setup_libraries_data}
+library(Seurat)
+library(tidyverse)
+library(edgeR)
+library(limma)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(patchwork)
+library(magrittr)
+library(cowplot)
+
+source(here::here("R/basic_processing.R"))
+source(here::here("R/analysis_wrappers.R"))
+
+BASE_SIZE <- 8
+
+out_dir <- here::here("output_figures/paper/extended_figures/supp_lgs/")
+tab_dir <- here::here("output_figures/paper/extended_figures/supp_lgs/tables/")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(tab_dir, recursive = TRUE, showWarnings = FALSE)
+
+# LGS genes derived from MINT sPLS-DA (see paper/lgs.Rmd)
+lgs_genes <- read.csv(here::here("output_figures/paper/lgs/lgs_genes.csv"))
+leptin_geneset <- lgs_genes$gene[lgs_genes$value.var < 0]
+
+# Load targets
+targets::tar_config_set(store = here::here("_targets"))
+targets::tar_load(arc_diet_labeled)
+targets::tar_load(pb_alldiet)
+targets::tar_load(celltypes_diet)
+names(pb_alldiet) <- celltypes_diet
+
+targets::tar_load(arc_lepip)
+targets::tar_load(pseudobulk_lepip)
+targets::tar_load(celltypes)
+names(pseudobulk_lepip) <- celltypes
+
+# Lepr-expressing clusters
+DefaultAssay(arc_diet_labeled) <- "RNA"
+lepr_exp <- AverageExpression(arc_diet_labeled, features = "Lepr", group.by = "seurat_clusters")
+lepclus  <- names(as.data.frame(lepr_exp$RNA))[which(lepr_exp$RNA > 1)]
+lepclus  <- lepclus[-5]
+
+lepr_pal  <- c("#B85182", "#9A84B7", "#A0C3E7", "#7B9E6B", "#E8B85D", "#D4A27F")[seq_along(lepclus)]
+lepr_cols <- setNames(lepr_pal, lepclus)
+
+all_lepr_labels <- c("Agrp" = "AgRP", "12" = "Lepr/Glp1r", "29" = "POMC",
+                      "26" = "Tbx19", "28" = "Irx3")
+```
+
+## Panel a — Fast vs DIO logFC anti-correlation across Lepr cell types
+
+```{r panel_a_cross_correlation}
+# Run per-cell-type edgeR models to extract per-contrast logFC
+pb_objects  <- list()
+fit_objects <- list()
+deg_results <- list()
+
+for (ct in lepclus) {
+    pb_objects[[ct]] <- pb_alldiet[[ct]]
+    pb_objects[[ct]]$samples$treatment <- factor(pb_objects[[ct]]$samples$treatment,
+                                                  levels = c("Chow", "HFD", "Refeed", "Fast"))
+    design <- model.matrix(~treatment + hash_pool, data = pb_objects[[ct]]$samples)
+    colnames(design) <- gsub(":", "_", colnames(design))
+    pb_objects[[ct]] <- estimateDisp(pb_objects[[ct]], design, robust = TRUE)
+    fit <- glmQLFit(pb_objects[[ct]], design, robust = TRUE)
+    fit_objects[[ct]] <- fit
+    qlf <- glmQLFTest(fit, coef = 2:4)
+    deg_results[[ct]] <- topTags(qlf, n = Inf, p = 0.05)
+}
+
+alldeg <- purrr::map_dfr(deg_results, data.frame, .id = "ct")
+
+# Per-cluster Pearson's r: Fast logFC vs HFD logFC (restricted to F-test DEGs)
+cor_by_ct <- purrr::map_dfr(lepclus, function(ct) {
+    ftest_genes <- alldeg %>% filter(ct == !!ct) %>% pull(gene)
+    if (length(ftest_genes) < 10) return(NULL)
+
+    fast_lfc <- topTags(glmQLFTest(fit_objects[[ct]], coef = "treatmentFast"), n = Inf)$table %>%
+        dplyr::select(gene, logFC_fast = logFC) %>% filter(gene %in% ftest_genes)
+    hfd_lfc  <- topTags(glmQLFTest(fit_objects[[ct]], coef = "treatmentHFD"), n = Inf)$table %>%
+        dplyr::select(gene, logFC_hfd = logFC) %>% filter(gene %in% ftest_genes)
+
+    merged <- inner_join(fast_lfc, hfd_lfc, by = "gene")
+    ct_test <- cor.test(merged$logFC_fast, merged$logFC_hfd, method = "pearson")
+
+    data.frame(ct = ct,
+               ct_label = all_lepr_labels[ct],
+               r = ct_test$estimate,
+               p = ct_test$p.value,
+               n_genes = nrow(merged))
+})
+
+write_csv(cor_by_ct, paste0(tab_dir, "fast_hfd_correlation_by_celltype.csv"))
+
+# Scatter plot for Lepr/Glp1r (cluster 12) with annotation
+ftest_degs_12 <- alldeg %>% filter(ct == "12") %>% pull(gene)
+
+fast_logfc_12 <- topTags(glmQLFTest(fit_objects[["12"]], coef = "treatmentFast"), n = Inf)$table %>%
+    dplyr::select(gene, logFC_fast = logFC) %>% filter(gene %in% ftest_degs_12)
+hfd_logfc_12  <- topTags(glmQLFTest(fit_objects[["12"]], coef = "treatmentHFD"), n = Inf)$table %>%
+    dplyr::select(gene, logFC_hfd = logFC) %>% filter(gene %in% ftest_degs_12)
+
+cor_df_12 <- inner_join(fast_logfc_12, hfd_logfc_12, by = "gene")
+cor_test_12 <- cor.test(cor_df_12$logFC_fast, cor_df_12$logFC_hfd, method = "pearson")
+cor_label_12 <- sprintf("r = %.2f, p = %.2e", cor_test_12$estimate, cor_test_12$p.value)
+
+p_scatter_12 <- ggplot(cor_df_12, aes(logFC_fast, logFC_hfd)) +
+    geom_point(size = 0.4, alpha = 0.4, color = lepr_cols["12"]) +
+    geom_smooth(method = "lm", color = "black", se = FALSE, linewidth = 0.5) +
+    annotate("text", x = -Inf, y = Inf, label = cor_label_12,
+             hjust = -0.1, vjust = 1.3, size = 2.5) +
+    labs(x = "Fasting vs Chow logFC", y = "HFD vs Chow logFC",
+         title = "Lepr/Glp1r neurons") +
+    theme_cowplot(font_size = BASE_SIZE)
+
+# Bar plot of r across all Lepr clusters
+p_corbar <- ggplot(cor_by_ct, aes(fct_reorder(ct_label, -r), r,
+                                   fill = I(lepr_cols[ct]))) +
+    geom_col(width = 0.7) +
+    geom_hline(yintercept = 0, lty = 2, color = "grey50") +
+    theme_cowplot(font_size = BASE_SIZE) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(x = NULL, y = "Pearson's r\n(Fast vs HFD logFC)")
+
+p_corbar + p_scatter_12
+ggsave(paste0(out_dir, "supp_lgs_a_fast_hfd_correlation.pdf"), h = 3.5, w = 7)
+```
+
+## Panel b — HFD vs Leptin IP gene overlap in Lepr/Glp1r neurons
+
+```{r panel_b_hfd_lep_overlap}
+# --- Diet: HFD vs Chow in cluster 12 ---
+pb_ov_diet <- edger_prep(
+    subset(arc_diet_labeled, subset = hash.mcl.ID != "REFED2"),
+    celltype_column = "seurat_clusters", trt_group = "treatment", celltypes = "12"
+)
+pb_ov_diet$samples$treatment <- factor(pb_ov_diet$samples$treatment,
+                                       levels = c("Chow", "HFD", "Refeed", "Fast"))
+design_ov  <- model.matrix(~treatment + hash_pool, data = pb_ov_diet$samples)
+pb_ov_diet <- estimateDisp(pb_ov_diet, design_ov, robust = TRUE)
+fit_ov     <- glmQLFit(pb_ov_diet, design_ov, robust = TRUE)
+qlf_hfd    <- glmQLFTest(fit_ov, coef = 2)
+diet_all   <- topTags(qlf_hfd, n = Inf)$table %>%
+    dplyr::select(gene, logFC_hfd = logFC, FDR_hfd = FDR)
+
+# --- Leptin: WT response in cluster 12 ---
+pb_ov_lep <- pseudobulk_lepip[["12"]]
+pb_ov_lep <- pb_ov_lep[, pb_ov_lep$samples$dataset == "lepip" & pb_ov_lep$samples$time != 24]
+colnames(pb_ov_lep) <- paste0(colnames(pb_ov_lep), "_", pb_ov_lep$samples$time)
+pb_ov_lep$samples$geno      <- factor(pb_ov_lep$samples$geno, levels = c("wt", "mut"))
+pb_ov_lep$samples$treatment <- factor(pb_ov_lep$samples$treatment, levels = c("Sal", "Lep"))
+pb_ov_lep$samples$time      <- factor(pb_ov_lep$samples$time, levels = c("1", "3", "6"))
+design_lep <- model.matrix(~geno + time + treatment + geno:treatment + hash_pool,
+                            data = pb_ov_lep$samples)
+colnames(design_lep) <- gsub(":", "_", gsub("[()]", "", colnames(design_lep)))
+fit_lep    <- voomLmFit(pb_ov_lep, design_lep)
+con_lep    <- makeContrasts(WT_Leptin = treatmentLep, levels = design_lep)
+fit2_lep   <- contrasts.fit(fit_lep, con_lep)
+fit2_lep   <- eBayes(fit2_lep, robust = TRUE)
+lep_all    <- topTable(fit2_lep, coef = "WT_Leptin", n = Inf) %>%
+    dplyr::select(gene, logFC_lep = logFC, FDR_lep = adj.P.Val)
+
+# --- Merge with directional consistency ---
+overlap_df <- inner_join(diet_all, lep_all, by = "gene") %>%
+    mutate(
+        same_dir  = sign(logFC_hfd) == sign(logFC_lep),
+        sig_group = case_when(
+            FDR_hfd < 0.05 & FDR_lep < 0.05 & same_dir  ~ "Concordant",
+            FDR_hfd < 0.05 & FDR_lep < 0.05 & !same_dir ~ "Discordant",
+            FDR_hfd < 0.05                               ~ "Diet only",
+            FDR_lep < 0.05                               ~ "Leptin only",
+            TRUE                                         ~ "Neither"
+        )
+    )
+
+write_csv(overlap_df, paste0(tab_dir, "hfd_lep_overlap_clus12.csv"))
+
+# --- Pearson correlation ---
+cor_test  <- cor.test(overlap_df$logFC_hfd, overlap_df$logFC_lep, method = "pearson")
+cor_label <- sprintf("r = %.2f, p = %.2e", cor_test$estimate, cor_test$p.value)
+
+p_hfd_lep <- ggplot(overlap_df, aes(logFC_hfd, logFC_lep, color = sig_group)) +
+    geom_point(size = 0.4, alpha = 0.4) +
+    geom_smooth(method = "lm", color = "black", se = FALSE, linewidth = 0.5) +
+    scale_color_manual(values = c(
+        "Concordant"  = "#C0392B",
+        "Discordant"  = "#8E44AD",
+        "Diet only"   = "#E67E22",
+        "Leptin only" = "#2980B9",
+        "Neither"     = "grey75"
+    )) +
+    annotate("text", x = -Inf, y = Inf, label = cor_label,
+             hjust = -0.1, vjust = 1.3, size = 2.5) +
+    labs(x = "HFD vs Chow logFC", y = "Leptin vs Saline logFC (WT)",
+         color = NULL, title = "Lepr/Glp1r neurons") +
+    theme_cowplot(font_size = BASE_SIZE) +
+    theme(legend.position = "bottom", legend.text = element_text(size = BASE_SIZE - 1))
+
+ggsave(paste0(out_dir, "supp_lgs_b_hfd_lep_correlation.pdf"), plot = p_hfd_lep, h = 4, w = 4)
+
+# --- Fisher's exact test ---
+cont_table <- with(overlap_df, table(
+    HFD_sig        = FDR_hfd < 0.05,
+    Leptin_concord = FDR_lep < 0.05 & same_dir
+))
+fish_res <- fisher.test(cont_table)
+
+cat("Fisher's exact test — concordant HFD x Leptin DEGs in Lepr/Glp1r neurons\n")
+print(cont_table)
+cat(sprintf("Odds ratio: %.2f  (95%% CI: %.2f-%.2f)\n",
+            fish_res$estimate, fish_res$conf.int[1], fish_res$conf.int[2]))
+cat(sprintf("p-value: %.3g\n", fish_res$p.value))
+```
+
+## Panel c — AgRP vs Glp1r/Lepr leptin response overlap
+
+```{r panel_c_agrp_glp1r_overlap}
+# --- AgRP neurons: WT leptin response ---
+pb_a <- pseudobulk_lepip[["Agrp"]]
+pb_a <- pb_a[, pb_a$samples$dataset == "lepip" & pb_a$samples$time != 24]
+colnames(pb_a) <- paste0(colnames(pb_a), "_", pb_a$samples$time)
+pb_a$samples$geno      <- factor(pb_a$samples$geno, levels = c("wt", "mut"))
+pb_a$samples$treatment <- factor(pb_a$samples$treatment, levels = c("Sal", "Lep"))
+pb_a$samples$time      <- factor(pb_a$samples$time, levels = c("1", "3", "6"))
+design_a <- model.matrix(~geno + time + treatment + geno:treatment + hash_pool, data = pb_a$samples)
+colnames(design_a) <- gsub(":", "_", gsub("[()]", "", colnames(design_a)))
+fit2_a   <- contrasts.fit(voomLmFit(pb_a, design_a),
+                          makeContrasts(WT_Leptin = treatmentLep, levels = design_a))
+fit2_a   <- eBayes(fit2_a, robust = TRUE)
+agrp_all <- topTable(fit2_a, coef = "WT_Leptin", n = Inf) %>%
+    dplyr::select(gene, logFC_agrp = logFC, FDR_agrp = adj.P.Val)
+
+# --- Glp1r/Lepr neurons (cluster 12): WT leptin response ---
+pb_g <- pseudobulk_lepip[["12"]]
+pb_g <- pb_g[, pb_g$samples$dataset == "lepip" & pb_g$samples$time != 24]
+colnames(pb_g) <- paste0(colnames(pb_g), "_", pb_g$samples$time)
+pb_g$samples$geno      <- factor(pb_g$samples$geno, levels = c("wt", "mut"))
+pb_g$samples$treatment <- factor(pb_g$samples$treatment, levels = c("Sal", "Lep"))
+pb_g$samples$time      <- factor(pb_g$samples$time, levels = c("1", "3", "6"))
+design_g <- model.matrix(~geno + time + treatment + geno:treatment + hash_pool, data = pb_g$samples)
+colnames(design_g) <- gsub(":", "_", gsub("[()]", "", colnames(design_g)))
+fit2_g   <- contrasts.fit(voomLmFit(pb_g, design_g),
+                          makeContrasts(WT_Leptin = treatmentLep, levels = design_g))
+fit2_g   <- eBayes(fit2_g, robust = TRUE)
+glp_all  <- topTable(fit2_g, coef = "WT_Leptin", n = Inf) %>%
+    dplyr::select(gene, logFC_glp = logFC, FDR_glp = adj.P.Val)
+
+# --- Merge ---
+overlap_ag <- inner_join(agrp_all, glp_all, by = "gene") %>%
+    mutate(
+        same_dir  = sign(logFC_agrp) == sign(logFC_glp),
+        sig_group = case_when(
+            FDR_agrp < 0.05 & FDR_glp < 0.05 & same_dir  ~ "Concordant",
+            FDR_agrp < 0.05 & FDR_glp < 0.05 & !same_dir ~ "Discordant",
+            FDR_agrp < 0.05                               ~ "AgRP only",
+            FDR_glp  < 0.05                               ~ "Glp1r only",
+            TRUE                                           ~ "Neither"
+        )
+    )
+
+write_csv(overlap_ag, paste0(tab_dir, "agrp_glp1r_leptin_overlap.csv"))
+
+count_df <- overlap_ag %>%
+    filter(sig_group != "Neither") %>%
+    dplyr::count(sig_group) %>%
+    mutate(sig_group = factor(sig_group, c("AgRP only", "Glp1r only", "Concordant", "Discordant")))
+
+cat("Leptin-regulated DEG overlap (AgRP vs Glp1r/Lepr, FDR < 0.05):\n")
+print(count_df)
+
+overlap_cols <- c("Concordant"  = "#C0392B",
+                  "Discordant"  = "#8E44AD",
+                  "AgRP only"   = "#9A84B7",
+                  "Glp1r only"  = "#B85182")
+
+p_bar <- ggplot(count_df, aes(sig_group, n, fill = sig_group)) +
+    geom_col(width = 0.7) +
+    geom_text(aes(label = n), vjust = -0.4, size = 2.5) +
+    scale_fill_manual(values = overlap_cols) +
+    theme_cowplot(font_size = BASE_SIZE) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 40, hjust = 1)) +
+    labs(x = NULL, y = "Number of DEGs")
+
+ggsave(paste0(out_dir, "supp_lgs_c_agrp_glp1r_overlap_bar.pdf"), plot = p_bar, h = 4, w = 4)
+
+cor_ag    <- cor.test(overlap_ag$logFC_agrp, overlap_ag$logFC_glp, method = "pearson")
+cor_label <- sprintf("r = %.2f, p = %.2e", cor_ag$estimate, cor_ag$p.value)
+
+p_scatter <- ggplot(overlap_ag, aes(logFC_agrp, logFC_glp, color = sig_group)) +
+    geom_point(size = 0.4, alpha = 0.4) +
+    geom_smooth(method = "lm", color = "black", se = FALSE, linewidth = 0.5) +
+    scale_color_manual(values = c(overlap_cols, "Neither" = "grey80")) +
+    annotate("text", x = -Inf, y = Inf, label = cor_label,
+             hjust = -0.1, vjust = 1.3, size = 2.5) +
+    labs(x = "AgRP logFC (Leptin vs Sal)",
+         y = "Glp1r/Lepr logFC (Leptin vs Sal)",
+         color = NULL) +
+    theme_cowplot(font_size = BASE_SIZE) +
+    theme(legend.position = "bottom", legend.text = element_text(size = BASE_SIZE - 1))
+
+ggsave(paste0(out_dir, "supp_lgs_c_agrp_glp1r_overlap_scatter.pdf"), plot = p_scatter, h = 4, w = 4)
+
+cont_ag  <- with(overlap_ag, table(
+    AgRP_sig      = FDR_agrp < 0.05,
+    Glp1r_concord = FDR_glp  < 0.05 & same_dir
+))
+fish_ag <- fisher.test(cont_ag)
+
+cat("\nFisher's exact test — concordant leptin response: AgRP vs Glp1r/Lepr\n")
+print(cont_ag)
+cat(sprintf("Odds ratio: %.2f  (95%% CI: %.2f-%.2f)\n",
+            fish_ag$estimate, fish_ag$conf.int[1], fish_ag$conf.int[2]))
+cat(sprintf("p-value: %.3g\n", fish_ag$p.value))
+```

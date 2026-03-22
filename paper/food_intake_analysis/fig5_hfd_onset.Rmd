@@ -1,0 +1,357 @@
+---
+title: "Figure 5b–c: HFD Onset — Body Weight, Food Intake, and Circadian Patterns"
+author: "Dylan Rausch"
+output: html_notebook
+---
+
+Glp1rLepr-KO vs control mice switched from chow to HFD. Tests whether leptin
+signaling in Glp1r neurons is required for the normal attenuation of hyperphagia
+during the onset of obesity.
+
+- **5b (top)**: Body weight trajectory
+- **5b (bottom)**: Cumulative food intake
+- **5c**: Daily food intake and dark-cycle vs light-cycle breakdown
+
+## Setup
+
+```{r setup, message=FALSE}
+library(tidyverse)
+library(lme4)
+library(car)
+library(emmeans)
+library(cowplot)
+library(lubridate)
+
+# -- Paths ---------------------------------------------------------------------
+feeding_file <- here::here("paper/food_intake_analysis/Agrp_Glp1R LepRflox Feeding_TP.DBR 05.2023.xlsx")
+out_dir <- here::here("output_figures/paper/extended_figures/ed_fig5_hfd")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -- Sample groups -------------------------------------------------------------
+sample_groups_df <- data.frame(
+  SampleID = c(
+    "Q0944", "Q0946", "Q0948", "R0084", "R0085", "R0086", "R0089", "R0090", "R0093",
+    "Q0941", "Q0942", "Q0943", "Q0945", "Q0949", "Q0950", "R0087", "R0088", "R0091", "R0092"
+  ),
+  Group = c(rep("Glp1R_LepR_KO", 9), rep("Control", 10))
+)
+
+cols <- c("#EBB395", "#97BCDA")
+```
+
+## Process Metabolic Cage Data
+
+```{r process-data}
+processed_data <- readxl::read_xlsx(feeding_file, sheet = 3,
+  col_types = c("date", "date", "text", "numeric", "numeric", "text", "text", "text")) %>%
+  dplyr::select(-Notes, -`...8`) %>%
+  inner_join(sample_groups_df, by = c("Mouse" = "SampleID")) %>%
+  janitor::clean_names() %>%
+  transmute(
+    date, food, body_weight,
+    diet = factor(diet),
+    mouse = factor(mouse),
+    group = factor(group),
+    hour = format(time, format = "%H:%M:%S", tz = "UTC"),
+    datetime = as.POSIXct(paste(date, hour), format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+  ) %>%
+  arrange(mouse) %>%
+  group_by(mouse, diet, group) %>%
+  mutate(
+    lag = lag(food),
+    intake = lag - food,
+    time_diff = as.numeric(datetime - lag(datetime)),
+    kcal = ifelse(grepl("Chow", diet), intake * 2.89, intake * 5.24),
+    day_diff = as.numeric(datetime - lag(datetime)),
+    date_adjusted = as.Date(datetime - hours(12))
+  )
+```
+
+## Figure 5b (top) — Body Weight
+
+### Model
+
+```{r model-bw}
+bw_data <- processed_data %>%
+  group_by(mouse, date, group, diet) %>%
+  summarise(bw = max(body_weight, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.infinite(bw)) %>%
+  group_by(mouse) %>%
+  mutate(
+    norm = mean(bw[date < "2025-01-06"], na.rm = TRUE),
+    time = factor((date - min(date)) / (60 * 60 * 24)),
+    plot_x = as.numeric(as.character(time))
+  )
+
+# LMM: body weight ~ genotype * time, normalized to baseline, HFD only
+model_bw <- lmer(log(bw) ~ group * factor(time) + norm + (1 | mouse),
+                 data = bw_data %>% filter(!grepl("Chow", diet), plot_x < 14))
+car::Anova(model_bw)
+
+pval_bw <- emmeans(model_bw, pairwise ~ group | time) %$%
+  contrasts %>%
+  data.frame() %>%
+  mutate(adj = p.adjust(p.value, method = "BH"))
+
+pval_bw
+```
+
+### Plot
+
+```{r plot-bw, fig.width=6, fig.height=4}
+bw_plot <- bw_data %>%
+  ggplot(aes(x = plot_x, y = bw / norm, color = group, fill = group)) +
+  stat_summary(geom = "point", size = 2) +
+  stat_summary(geom = "line", linewidth = 1) +
+  stat_summary(geom = "ribbon", alpha = 0.5, linewidth = 0) +
+  geom_text(
+    data = pval_bw %>%
+      inner_join(bw_data %>% filter(group == "Glp1R_LepR_KO") %>%
+                   group_by(time, plot_x) %>% summarise(mean = mean(bw / norm), .groups = "drop"),
+                 by = c("time")) %>%
+      mutate(
+        label = case_when(adj < 0.001 ~ "***", adj < 0.01 ~ "**", adj < 0.05 ~ "*", TRUE ~ ""),
+        y.position = mean + 0.05
+      ),
+    aes(x = plot_x, y = y.position, label = label), inherit.aes = FALSE
+  ) +
+  scale_color_manual(values = cols) +
+  scale_fill_manual(values = cols) +
+  scale_x_continuous(breaks = seq(0, 60, by = 7)) +
+  cowplot::theme_cowplot(font_size = 8) +
+  labs(x = "Days on HFD", y = "Body Weight (normalized)")
+
+bw_plot
+ggsave(file.path(out_dir, "bw_hfd.pdf"), h = 4, w = 6)
+```
+
+## Figure 5b (bottom) — Cumulative Food Intake
+
+### Model
+
+```{r model-cum-intake}
+hfd_full_intake <- processed_data %>%
+  filter(!is.na(intake)) %>%
+  group_by(mouse, date_adjusted, diet, group) %>%
+  reframe(sum = sum(kcal), tot_time = sum(time_diff)) %>%
+  group_by(mouse) %>%
+  mutate(
+    cum_int = cumsum(sum),
+    norm = mean(sum[date_adjusted < "2025-01-06"], na.rm = TRUE),
+    time = factor(1:n()),
+    day_num = as.numeric(as.character(time)),
+    log_day = log(day_num)
+  )
+
+# Log-time model for cumulative intake (consistent with other cumulative models)
+model_cum <- lmer(log(cum_int) ~ group * log_day + norm + (1 | mouse),
+                  data = hfd_full_intake %>% filter(!grepl("Chow", diet)))
+car::Anova(model_cum, type = "II")
+
+# Factor-time model for timepoint-specific contrasts (plot annotations)
+model_cum_fac <- lmer(log(cum_int) ~ group * factor(time) + norm + (1 | mouse),
+                      data = hfd_full_intake %>% filter(!grepl("Chow", diet)))
+
+pval_cum <- emmeans(model_cum_fac, pairwise ~ group | time) %$%
+  contrasts %>%
+  data.frame() %>%
+  mutate(adj = p.adjust(p.value, method = "BH"))
+
+pval_cum
+```
+
+### Plot
+
+```{r plot-cum-intake, fig.width=6, fig.height=4}
+cum_kcal <- hfd_full_intake %>%
+  ggplot(aes(x = as.numeric(as.character(time)), y = cum_int,
+             color = group, fill = group)) +
+  stat_summary(geom = "point", size = 2) +
+  stat_summary(geom = "line", linewidth = 1) +
+  stat_summary(geom = "ribbon", alpha = 0.5, linewidth = 0) +
+  geom_text(
+    data = pval_cum %>%
+      inner_join(hfd_full_intake %>% filter(group == "Glp1R_LepR_KO") %>%
+                   group_by(time) %>% summarise(mean = mean(cum_int), .groups = "drop"),
+                 by = "time") %>%
+      mutate(
+        label = case_when(adj < 0.001 ~ "***", adj < 0.01 ~ "**", adj < 0.05 ~ "*", TRUE ~ ""),
+        y.position = mean + 10
+      ),
+    aes(x = as.numeric(as.character(time)), y = y.position, label = label),
+    inherit.aes = FALSE
+  ) +
+  scale_color_manual(values = cols) +
+  scale_fill_manual(values = cols) +
+  cowplot::theme_cowplot(font_size = 8) +
+  labs(x = "Day", y = "Cumulative Intake (kcal)")
+
+cum_kcal
+ggsave(file.path(out_dir, "cum_kcal.pdf"), h = 4, w = 6)
+```
+
+## Figure 5c — Daily Food Intake
+
+### Model
+
+```{r model-daily-intake}
+hfd_model_data <- hfd_full_intake %>%
+  mutate(time = factor(time))
+
+model_daily <- lmer(log(sum) ~ group * time + norm + (1 | mouse),
+                    data = hfd_model_data %>% filter(!grepl("Chow", diet)))
+car::Anova(model_daily, type = "II")
+
+pval_daily <- emmeans(model_daily, pairwise ~ group | time) %$%
+  contrasts %>%
+  data.frame() %>%
+  mutate(adj = p.adjust(p.value, method = "BH"))
+
+pval_daily
+```
+
+### Plot
+
+```{r plot-daily-intake, fig.width=6, fig.height=4}
+hfd_full_intake %>%
+  ggplot(aes(x = as.numeric(as.character(time)), y = sum,
+             color = group, fill = group)) +
+  stat_summary(geom = "point", size = 3) +
+  stat_summary(geom = "line", linewidth = 1) +
+  stat_summary(geom = "ribbon", alpha = 0.5) +
+  geom_vline(xintercept = 3, lty = 2, linewidth = 1, color = "grey50") +
+  geom_text(
+    data = pval_daily %>%
+      inner_join(hfd_full_intake %>% filter(group == "Glp1R_LepR_KO") %>%
+                   group_by(time) %>% summarise(mean = mean(sum), .groups = "drop"),
+                 by = "time") %>%
+      mutate(
+        label = case_when(adj < 0.001 ~ "***", adj < 0.01 ~ "**", adj < 0.05 ~ "*", TRUE ~ ""),
+        y.position = mean + 2
+      ),
+    aes(x = as.numeric(as.character(time)), y = y.position, label = label),
+    inherit.aes = FALSE
+  ) +
+  scale_color_manual(values = cols) +
+  scale_fill_manual(values = cols) +
+  cowplot::theme_cowplot(font_size = 8) +
+  labs(x = "Day", y = "Food Intake (kcal)")
+
+ggsave(file.path(out_dir, "kcal_dio.pdf"), h = 4)
+```
+
+## Figure 5c — Dark Cycle vs Light Cycle
+
+### Models
+
+```{r model-circadian}
+circ_data <- processed_data %>%
+  group_by(mouse, date_adjusted, group) %>%
+  mutate(pct = kcal / sum(kcal), diet, n = length(unique(diet))) %>%
+  group_by(date_adjusted) %>%
+  mutate(time = day(date_adjusted) - 2) %>%
+  ungroup() %>%
+  mutate(night = ifelse(hour < 12, "DC", "LC")) %>%
+  group_by(mouse) %>%
+  mutate(
+    night_kcal = mean(kcal[diet == "5LOD Chow" & night == "DC"], na.rm = TRUE),
+    day_kcal = mean(kcal[diet == "5LOD Chow" & night == "LC"], na.rm = TRUE),
+    norm_kcal = mean(kcal[diet == "5LOD Chow"], na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# --- Dark cycle model (Type II) ---
+night_intake <- circ_data %>%
+  filter(night == "DC") %>%
+  mutate(time = as.factor(time))
+
+mod_night <- lmer(log(kcal) ~ night_kcal + group * time + (1 | mouse),
+                  data = night_intake %>% filter(!grepl("Chow", diet)))
+car::Anova(mod_night, type = "II")
+
+pval_night <- emmeans(mod_night, pairwise ~ group | time) %$%
+  contrasts %>%
+  data.frame() %>%
+  mutate(adj = p.adjust(p.value, method = "BH"))
+
+pval_night
+
+# --- Light cycle model (Type II for consistency) ---
+day_intake <- circ_data %>%
+  filter(night == "LC") %>%
+  mutate(time = as.factor(time))
+
+mod_day <- lmer(log(kcal) ~ day_kcal + group * time + (1 | mouse),
+                data = day_intake %>% filter(!grepl("Chow", diet)))
+car::Anova(mod_day, type = "II")
+
+pval_day <- emmeans(mod_day, pairwise ~ group | time) %$%
+  contrasts %>%
+  data.frame() %>%
+  mutate(adj = p.adjust(p.value, method = "BH"))
+
+pval_day
+```
+
+### Plot
+
+```{r plot-circadian, fig.width=6, fig.height=6}
+circ_data %>%
+  filter(time < 10) %>%
+  mutate(time = factor(time),
+         norm_kcal = ifelse(night == "DC", night_kcal, day_kcal)) %>%
+  ggplot(aes(x = time, y = kcal / norm_kcal, lty = group, color = group, fill = group)) +
+  stat_summary(geom = "point", size = 3) +
+  stat_summary(geom = "line", linewidth = 1) +
+  stat_summary(geom = "ribbon", alpha = 0.5, linewidth = 0) +
+  scale_color_manual(values = cols) +
+  scale_fill_manual(values = cols) +
+  cowplot::theme_cowplot(font_size = 8) +
+  geom_vline(xintercept = 3, lty = 2, linewidth = 1, color = "grey50") +
+  facet_wrap(~ night, ncol = 1, scales = "free_y") +
+  labs(x = "Day", y = "Food Intake (normalized to baseline)")
+
+ggsave(file.path(out_dir, "circ_intake.pdf"), h = 6, w = 6)
+```
+
+## Extended Data Figure 6b — Individual mouse daily intake traces
+
+```{r individual-traces, fig.width=6, fig.height=4}
+hfd_full_intake %>%
+  filter(!grepl("Chow", diet)) %>%
+  ggplot(aes(x = as.numeric(as.character(time)), y = sum, group = mouse, color = group)) +
+  geom_line(alpha = 0.4, linewidth = 0.5) +
+  stat_summary(aes(group = group), geom = "line", linewidth = 1.5, fun = mean) +
+  geom_vline(xintercept = 3, lty = 2, linewidth = 0.6, color = "grey50") +
+  scale_color_manual(values = cols) +
+  cowplot::theme_cowplot(font_size = 8) +
+  labs(x = "Day on HFD", y = "Daily food intake (kcal)", color = NULL)
+
+ggsave(file.path(out_dir, "ed6b_individual_traces.pdf"), h = 4, w = 6)
+```
+
+## Extended Data — Cumulative intake individual traces
+
+```{r individual-cum-traces, fig.width=6, fig.height=4}
+hfd_full_intake %>%
+  filter(!grepl("Chow", diet)) %>%
+  ggplot(aes(x = as.numeric(as.character(time)), y = cum_int, group = mouse, color = group)) +
+  geom_line(alpha = 0.4, linewidth = 0.5) +
+  stat_summary(aes(group = group), geom = "line", linewidth = 1.5, fun = mean) +
+  scale_color_manual(values = cols) +
+  cowplot::theme_cowplot(font_size = 8) +
+  labs(x = "Day on HFD", y = "Cumulative food intake (kcal)", color = NULL)
+
+ggsave(file.path(out_dir, "ed6b_individual_cum_traces.pdf"), h = 4, w = 6)
+```
+
+## Summary
+
+All models use `group * factor(time) + baseline_covariate + (1|mouse)`.
+The primary result for each panel is the `group:time` interaction from
+`car::Anova()`, testing whether genotype differences in food intake or body
+weight diverge over time. Post-hoc contrasts at each timepoint are BH-corrected.
+
+**Note:** Both dark-cycle and light-cycle models now use Type II tests for
+consistency. The baseline covariate is period-specific (dark-cycle baseline for
+the dark model, light-cycle baseline for the light model).

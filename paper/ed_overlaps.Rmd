@@ -1,0 +1,206 @@
+---
+title: "Extended Data — DE gene overlaps and scDist full results"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r setup_libraries_data}
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+BASE_SIZE <- 8
+out_dir <- here::here("output_figures/paper/extended_figures/overlaps/")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+targets::tar_config_set(store = here::here("_targets"))
+targets::tar_load(arc_diet_labeled)
+targets::tar_load(hfdveh_celldist)
+targets::tar_load(fastveh_celldist)
+targets::tar_load(lepip_celldist)
+targets::tar_load(celltypes_diet)
+```
+
+## Leptin IP × Diet gene overlap (Supplementary Figure)
+
+```{r overlap_venn, fig.width=6, fig.height=5}
+lep_de <- read.csv(here::here("output_figures/paper/figure2/tables/glp1r_leptin_degs_wt.csv"))
+diet_de <- read.csv(here::here("output_figures/paper/figure2/tables/diet_degenes.csv"))
+
+lep_up <- lep_de$gene[lep_de$adj.P.Val < 0.05 & lep_de$logFC > 0]
+lep_dn <- lep_de$gene[lep_de$adj.P.Val < 0.05 & lep_de$logFC < 0]
+
+d12 <- diet_de %>% filter(ct == "12")
+hfd_up <- d12$gene[d12$FDR < 0.05 & d12$logFC.treatmentHFD > 0]
+hfd_dn <- d12$gene[d12$FDR < 0.05 & d12$logFC.treatmentHFD < 0]
+
+# Concordant overlaps
+up_overlap <- intersect(lep_up, hfd_up)
+dn_overlap <- intersect(lep_dn, hfd_dn)
+
+# Create data for upset-style visualization
+bg <- intersect(lep_de$gene, d12$gene)
+overlap_df <- data.frame(
+    gene = bg,
+    Leptin_up = bg %in% lep_up,
+    Leptin_dn = bg %in% lep_dn,
+    HFD_up = bg %in% hfd_up,
+    HFD_dn = bg %in% hfd_dn
+)
+
+# Scatter plot: leptin IP logFC vs HFD logFC
+merged <- lep_de %>%
+    dplyr::select(gene, lep_logFC = logFC, lep_padj = adj.P.Val) %>%
+    inner_join(d12 %>% dplyr::select(gene, hfd_logFC = logFC.treatmentHFD, hfd_fdr = FDR), by = "gene") %>%
+    mutate(
+        category = case_when(
+            lep_padj < 0.05 & hfd_fdr < 0.05 & sign(lep_logFC) == sign(hfd_logFC) ~ "Concordant",
+            lep_padj < 0.05 & hfd_fdr < 0.05 & sign(lep_logFC) != sign(hfd_logFC) ~ "Discordant",
+            lep_padj < 0.05 ~ "Leptin only",
+            hfd_fdr < 0.05 ~ "HFD only",
+            TRUE ~ "NS"
+        )
+    )
+
+cat_cols <- c("Concordant" = "#E74C3C", "Discordant" = "#3498DB",
+              "Leptin only" = "#F39C12", "HFD only" = "#2ECC71", "NS" = "grey85")
+
+p_scatter <- ggplot(merged, aes(hfd_logFC, lep_logFC, color = category)) +
+    geom_point(data = ~filter(.x, category == "NS"), size = 0.3, alpha = 0.3) +
+    geom_point(data = ~filter(.x, category != "NS"), size = 1, alpha = 0.7) +
+    scale_color_manual(values = cat_cols) +
+    geom_hline(yintercept = 0, lty = 2, color = "grey50") +
+    geom_vline(xintercept = 0, lty = 2, color = "grey50") +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    labs(x = "log2FC (HFD vs Chow)", y = "log2FC (Leptin vs Vehicle)",
+         title = "Lepr/Glp1r neurons") +
+    annotate("text", x = max(merged$hfd_logFC) * 0.7, y = max(merged$lep_logFC) * 0.9,
+             label = paste0("Concordant: ", sum(merged$category == "Concordant")),
+             size = 2.5, color = "#E74C3C")
+
+ggsave(paste0(out_dir, "lepip_hfd_overlap_scatter.pdf"), plot = p_scatter, h = 5, w = 6)
+
+# Fisher's exact stats
+cat("Concordant up:", length(up_overlap), "\n")
+cat("Concordant dn:", length(dn_overlap), "\n")
+
+write_csv(merged, paste0(out_dir, "lepip_hfd_overlap_genes.csv"))
+```
+
+## Venn diagram — leptin IP vs DIO DEGs
+
+```{r venn_lepip_hfd, fig.width=4, fig.height=4}
+library(VennDiagram)
+
+lep_sig <- lep_de$gene[lep_de$adj.P.Val < 0.05]
+hfd_sig <- d12$gene[d12$FDR < 0.05]
+
+n_lep <- length(lep_sig)
+n_hfd <- length(hfd_sig)
+n_overlap <- length(intersect(lep_sig, hfd_sig))
+n_bg <- length(bg)
+
+# Fisher's exact test for enrichment of overlap
+a <- n_overlap
+b <- n_hfd - n_overlap
+c <- n_lep - n_overlap
+d <- n_bg - n_lep - n_hfd + n_overlap
+cont <- matrix(c(max(a,0), max(b,0), max(c,0), max(d,0)), nrow = 2)
+fisher_res <- fisher.test(cont, alternative = "greater")
+fisher_p <- fisher_res$p.value
+
+p_venn <- draw.pairwise.venn(
+    area1 = n_lep,
+    area2 = n_hfd,
+    cross.area = n_overlap,
+    category = c("Leptin IP DEGs", "DIO DEGs"),
+    fill = c("#F39C12", "#2ECC71"),
+    alpha = 0.5,
+    cat.cex = 0.9,
+    cex = 1.2,
+    cat.pos = c(-30, 30),
+    cat.dist = c(0.05, 0.05),
+    fontfamily = "sans",
+    cat.fontfamily = "sans",
+    sub = sprintf("Fisher's exact p = %.2e", fisher_p),
+    sub.cex = 0.8
+)
+
+pdf(paste0(out_dir, "lepip_hfd_venn.pdf"), width = 4, height = 4)
+grid.draw(p_venn)
+grid.text(sprintf("Fisher's exact p = %.2e", fisher_p),
+          x = 0.5, y = 0.05, gp = gpar(fontsize = 8))
+dev.off()
+
+cat("Leptin IP DEGs:", n_lep, "\n")
+cat("HFD DEGs:", n_hfd, "\n")
+cat("Overlap:", n_overlap, "\n")
+cat("Background genes tested:", n_bg, "\n")
+cat("Fisher's exact p-value:", fisher_p, "\n")
+cat("Odds ratio:", fisher_res$estimate, "\n")
+```
+
+## scDist full results — all clusters
+
+```{r scdist_full, fig.width=8, fig.height=5}
+# Extract results dataframes from scDist list objects
+hfd_dist <- hfdveh_celldist$results %>%
+    rownames_to_column("cell_type") %>%
+    mutate(comparison = "HFD vs Chow")
+
+fast_dist <- fastveh_celldist$results %>%
+    rownames_to_column("cell_type") %>%
+    mutate(comparison = "Fast vs Chow")
+
+lep_dist <- lepip_celldist$results %>%
+    rownames_to_column("cell_type") %>%
+    mutate(comparison = "Leptin vs Saline")
+
+all_dist <- bind_rows(hfd_dist, fast_dist, lep_dist) %>%
+    rename(estimate = `Dist.`, ci_lo = `95% CI (low)`, ci_hi = `95% CI (upper)`, pval = p.val)
+
+p_dist <- all_dist %>%
+    ggplot(aes(x = reorder(cell_type, estimate), y = estimate, fill = comparison)) +
+    geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+    geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi),
+                  position = position_dodge(width = 0.8), width = 0.2) +
+    coord_flip() +
+    facet_wrap(~comparison, scales = "free_x") +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(strip.background = element_blank(), legend.position = "none") +
+    labs(x = NULL, y = "Transcriptional distance")
+
+ggsave(paste0(out_dir, "scdist_all_comparisons.pdf"), plot = p_dist, h = 6, w = 12)
+
+write_csv(all_dist, paste0(out_dir, "scdist_all_results.csv"))
+```
+
+## Pearson correlations — fasting vs DIO fold changes per cluster
+
+```{r pearson_all_clusters, fig.width=8, fig.height=6}
+diet_de_full <- read.csv(here::here("output_figures/paper/figure2/tables/diet_degenes.csv"))
+
+cor_results <- diet_de_full %>%
+    group_by(ct) %>%
+    summarise(
+        r = cor(logFC.treatmentFast, logFC.treatmentHFD, use = "complete.obs"),
+        p = cor.test(logFC.treatmentFast, logFC.treatmentHFD)$p.value,
+        n = n(),
+        .groups = "drop"
+    ) %>%
+    mutate(padj = p.adjust(p, method = "BH"))
+
+p_cor <- cor_results %>%
+    ggplot(aes(x = reorder(ct, r), y = r, fill = padj < 0.05)) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_manual(values = c("TRUE" = "#2C3E50", "FALSE" = "grey70")) +
+    geom_hline(yintercept = 0, lty = 2) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    labs(x = NULL, y = "Pearson r (Fast vs HFD fold changes)", fill = "FDR<0.05")
+
+ggsave(paste0(out_dir, "pearson_fast_hfd_all_clusters.pdf"), plot = p_cor, h = 6, w = 6)
+write_csv(cor_results, paste0(out_dir, "pearson_fast_hfd_all_clusters.csv"))
+```

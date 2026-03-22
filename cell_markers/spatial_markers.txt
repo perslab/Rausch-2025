@@ -1,0 +1,23 @@
+>Endothelial
+expressed: Adgrl4,Cldn5,Ly6a 
+not expressed: Agrp, Pomc, Glp1r, Kiss1, Gad1, Gad2, Slc17a6
+
+>Tanycyte
+expressed: Crym, Rax, Frzb, Foxj1, Tmem212
+not expressed: Agrp, Pomc, Glp1r, Kiss1, Gad1, Gad2, Slc17a6
+
+>Oligos
+expressed: Sox10, Mog, Mbp, Pdgfra 
+not expressed: Agrp, Pomc, Glp1r, Kiss1, Gad1, Gad2, Slc17a6
+
+>Microglia
+expressed: Cx3cr1, Trem2, Fcrls, Laptm5 
+not expressed: Agrp, Pomc, Glp1r, Kiss1, Gad1, Gad2, Slc17a6
+
+>Astrocytes
+expressed: Aldh1l1, Ntsr2, Fgfr3 
+not expressed: Agrp, Pomc, Glp1r, Kiss1, Gad1, Gad2, Slc17a6
+
+>Neurons
+expressed: Gad1, Gad2, Slc17a6
+not expressed: Aldh1l1, Cx3cr1, Sox10,Tmem212

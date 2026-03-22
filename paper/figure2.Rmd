@@ -1,0 +1,950 @@
+---
+title: "Figure 2 — Lepr/Glp1r neurons progressively adapt to diet-induced obesity"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r setup_libraries_data}
+library(Seurat)
+library(paletteer)
+library(tidyverse)
+library(edgeR)
+library(ComplexHeatmap)
+library(circlize)
+library(DESeq2)
+library(dynamicTreeCut)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(patchwork)
+library(magrittr)
+library(lme4)
+library(emmeans)
+
+source(here::here("R/basic_processing.R"))
+source(here::here("R/analysis_wrappers.R"))
+source(here::here("R/helper_functions.R"))
+
+BASE_SIZE <- 8
+
+fig_path_2 <- here::here("output_figures/paper/figure2/")
+tab_path_2 <- here::here("output_figures/paper/figure2/tables/")
+
+cols_by_geno <- c("mut" = "red", "wt" = "grey70")
+cols_by_diet <- c("grey70", "#cb6a49", "#a46cb7", "#7aa457")
+diet_cols    <- c("HFD" = "#E8682F", "Chow" = "#F0AD74", "Refeed" = "#58C2AF", "Fast" = "#165C5B")
+my_colors    <- paletteer::paletteer_d("lisa::FridaKahlo")
+
+activity_genes <- c("Bdnf", "Crem", "Egr1", "Nr4a1", "Nr4a3",
+                    "Pde10a", "Fos", "Fosb", "Fosl2", "Homer1",
+                    "Jun", "Junb", "Vgf")
+
+# LGS genes derived from MINT sPLS-DA (see paper/lgs.Rmd)
+lgs_genes <- read.csv(here::here("output_figures/paper/lgs/lgs_genes.csv"))
+leptin_geneset <- lgs_genes$gene[lgs_genes$value.var < 0]
+
+# Load all required targets
+targets::tar_config_set(store = here::here("_targets"))
+targets::tar_load(arc_diet_labeled)
+targets::tar_load(pb_alldiet)
+targets::tar_load(celltypes_diet)
+names(pb_alldiet) <- celltypes_diet
+
+targets::tar_load(hfdveh_celldist)
+targets::tar_load(fastveh_celldist)
+
+targets::tar_load(arc_lepip)
+targets::tar_load(pseudobulk_lepip)
+targets::tar_load(celltypes)
+names(pseudobulk_lepip) <- celltypes
+
+targets::tar_load(lepip_celldist)
+targets::tar_load(obwt_celldist)
+
+# Compute Lepr-expressing clusters — shared across all panels
+DefaultAssay(arc_diet_labeled) <- "RNA"
+lepr_exp <- AverageExpression(arc_diet_labeled, features = "Lepr", group.by = "seurat_clusters")
+lepclus  <- names(as.data.frame(lepr_exp$RNA))[which(lepr_exp$RNA > 1)]
+lepclus  <- lepclus[-5]   # drop low-quality cluster (5th element)
+
+# Shared color palette for Lepr clusters across all panels
+lepr_pal  <- c("#B85182", "#9A84B7", "#A0C3E7", "#7B9E6B", "#E8B85D", "#D4A27F")[seq_along(lepclus)]
+lepr_cols <- setNames(lepr_pal, lepclus)
+```
+
+## Figure 2b — UMAP of MBH neurons with Lepr subtypes highlighted
+
+```{r panel_2b_umap}
+# Build color vector: Lepr clusters = distinct colors, all others = grey90
+all_clusters <- as.character(sort(unique(arc_diet_labeled$seurat_clusters)))
+umap_cols    <- setNames(rep("grey90", length(all_clusters)), all_clusters)
+umap_cols[names(lepr_cols)] <- lepr_cols
+
+p1 <- DimPlot(arc_diet_labeled, group.by = "seurat_clusters",
+              cols = umap_cols, pt.size = 0.1) +
+    theme_void() + NoLegend() + ggtitle(NULL)
+
+p2 <- DimPlot(arc_diet_labeled, group.by = "treatment",
+              cols = diet_cols, pt.size = 0.1, shuffle = TRUE) +
+    theme_void() + NoLegend() + ggtitle(NULL)
+
+p1 + p2
+ggsave(paste0(fig_path_2, "figure2b_umap.pdf"), h = 3, w = 6)
+```
+
+## Figure 2c — Diet effects on neuronal transcriptomes (scDist)
+
+```{r panel_2c_celldist}
+dat_fast <- fastveh_celldist$results %>%
+    janitor::clean_names() %>%
+    rownames_to_column("clus") %>%
+    dplyr::select(clus, dist, x95_percent_ci_low, x95_percent_ci_upper)
+
+dat_hfd <- hfdveh_celldist$results %>%
+    janitor::clean_names() %>%
+    rownames_to_column("clus") %>%
+    dplyr::select(clus, dist, x95_percent_ci_low, x95_percent_ci_upper)
+
+merged_df <- merge(dat_fast, dat_hfd, by = "clus", suffixes = c("_fast", "_hfd")) %>%
+    mutate(
+        pt_color  = ifelse(clus %in% names(lepr_cols), lepr_cols[clus], "grey70"),
+        pt_alpha  = ifelse(clus %in% names(lepr_cols), 1, 0.5),
+        clus_label = ifelse(clus %in% names(lepr_cols), clus, "")
+    )
+
+ggplot(merged_df, aes(x = dist_fast, y = dist_hfd)) +
+    geom_errorbarh(aes(xmin = x95_percent_ci_low_fast, xmax = x95_percent_ci_upper_fast,
+                       color = I(pt_color)), height = 0, alpha = 0.3, linewidth = 0.4) +
+    geom_errorbar(aes(ymin = x95_percent_ci_low_hfd, ymax = x95_percent_ci_upper_hfd,
+                      color = I(pt_color)), width = 0, alpha = 0.3, linewidth = 0.4) +
+    geom_point(aes(color = I(pt_color), alpha = I(pt_alpha)), size = 2) +
+    geom_abline(lty = 2, linewidth = 0.4) +
+    ggrepel::geom_text_repel(aes(label = clus_label),
+                             size = 2.5, max.overlaps = 15, show.legend = FALSE) +
+    labs(x = "Fasting Effect", y = "HFD Effect") +
+    coord_equal() +
+    cowplot::theme_cowplot(font_size = BASE_SIZE)
+
+ggsave(paste0(fig_path_2, "figure2c_celldist.pdf"), h = 5, w = 5)
+```
+
+## Figure 2d — Leptin gene signature (LGS) across diet conditions
+
+```{r panel_2d_lgs}
+DefaultAssay(arc_diet_labeled) <- "RNA"
+arc_diet_labeled <- AddModuleScore(arc_diet_labeled, features = list(leptin_geneset), assay = "RNA")
+
+# All Lepr clusters for stats; focal 3 for plotting
+all_lepr_clusters <- c("Agrp", "12", "29", "26", "28")
+all_lepr_labels   <- c("Agrp" = "AgRP", "12" = "Lepr/Glp1r", "29" = "POMC",
+                        "26" = "Tbx19", "28" = "Irx3")
+focal_labels <- c("AgRP", "Lepr/Glp1r", "POMC")
+
+lgs_all <- arc_diet_labeled[[]] %>%
+    filter(seurat_clusters %in% all_lepr_clusters) %>%
+    mutate(ct_label  = all_lepr_labels[as.character(seurat_clusters)],
+           ct_label  = factor(ct_label, c("AgRP", "Lepr/Glp1r", "POMC", "Tbx19", "Irx3")),
+           treatment = fct_relevel(treatment, c("Fast", "Refeed", "Chow", "HFD"))) %>%
+    group_by(hash.mcl.ID, hash_pool, treatment, ct_label) %>%
+    summarise(mean_lgs = mean(Cluster1), .groups = "drop")
+
+# Model + contrasts across all Lepr clusters, adjust together
+lgs_emm <- lgs_all %>%
+    nest(data = -ct_label) %>%
+    mutate(
+        mod = purrr::map(data, ~lm(mean_lgs ~ treatment, data = .x)),
+        emm = purrr::map(mod, ~emmeans::emmeans(.x, pairwise ~ treatment)$contrasts %>% data.frame())
+    ) %>%
+    unnest(emm) %>%
+    ungroup() %>%
+    mutate(padj = p.adjust(p.value, "BH")) %>%
+    dplyr::select(ct_label, contrast, estimate, SE, p.value, padj)
+
+# Filter to focal 3 for plotting
+lgs_focal <- lgs_all %>% filter(ct_label %in% focal_labels)
+
+write_csv(lgs_emm, paste0(tab_path_2, "lgs_focal_diet_stats.csv"))
+
+# Consecutive comparisons only: Fast-Refeed, Refeed-Chow, Chow-HFD
+consecutive_contrasts <- c("Fast - Refeed", "Refeed - Fast",
+                           "Refeed - Chow", "Chow - Refeed",
+                           "Chow - HFD", "HFD - Chow")
+
+sig_label <- function(p) case_when(p < 0.001 ~ "***", p < 0.01 ~ "**", p < 0.05 ~ "*", p < 0.1 ~ "+", TRUE ~ "ns")
+
+# Build ggsignif annotation data from emmeans results
+signif_df <- lgs_emm %>%
+    filter(ct_label %in% focal_labels, contrast %in% consecutive_contrasts) %>%
+    mutate(
+        xmin = case_when(grepl("Fast.*Refeed|Refeed.*Fast", contrast) ~ "Fast",
+                         grepl("Refeed.*Chow|Chow.*Refeed", contrast) ~ "Refeed",
+                         grepl("Chow.*HFD|HFD.*Chow", contrast) ~ "Chow"),
+        xmax = case_when(grepl("Fast.*Refeed|Refeed.*Fast", contrast) ~ "Refeed",
+                         grepl("Refeed.*Chow|Chow.*Refeed", contrast) ~ "Chow",
+                         grepl("Chow.*HFD|HFD.*Chow", contrast) ~ "HFD"),
+        label = sig_label(padj)
+    ) %>%
+    filter(label != "ns") %>%
+    distinct(ct_label, xmin, xmax, label, padj)
+
+# Compute y positions per facet
+y_max_df <- lgs_focal %>%
+    group_by(ct_label) %>%
+    summarise(y_max = max(mean_lgs), .groups = "drop")
+y_range <- diff(range(lgs_focal$mean_lgs))
+
+signif_df <- signif_df %>%
+    left_join(y_max_df, by = "ct_label") %>%
+    group_by(ct_label) %>%
+    mutate(y_pos = y_max + y_range * 0.05 * row_number()) %>%
+    ungroup()
+
+p_lgs <- ggplot(lgs_focal, aes(treatment, mean_lgs, fill = treatment)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6, linewidth = 0.35) +
+    geom_jitter(width = 0.15, size = 0.5, alpha = 0.5, shape = 16) +
+    facet_wrap(~ct_label, nrow = 1, scales = "free_y") +
+    scale_fill_manual(values = diet_cols) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(axis.text.x    = element_text(angle = 45, hjust = 1),
+          legend.position = "none",
+          strip.background = element_blank()) +
+    labs(x = NULL, y = "Leptin Gene Signature")
+
+if (nrow(signif_df) > 0) {
+    p_lgs <- p_lgs +
+        ggsignif::geom_signif(
+            data = signif_df, inherit.aes = FALSE,
+            aes(xmin = xmin, xmax = xmax, y_position = y_pos, annotations = label),
+            manual = TRUE, textsize = 2.5, tip_length = 0.01, vjust = 0.5
+        )
+}
+
+ggsave(paste0(fig_path_2, "figure2d_lgs.pdf"), plot = p_lgs, h = 3, w = 5)
+```
+
+## Figure 2d (all clusters) — LGS across all Lepr clusters
+
+```{r panel_2d_lgs_all_clusters}
+# Consecutive contrasts for all clusters
+consecutive_all <- c("Fast - Refeed", "Refeed - Fast",
+                     "Refeed - Chow", "Chow - Refeed",
+                     "Chow - HFD", "HFD - Chow")
+
+signif_all <- lgs_emm %>%
+    filter(contrast %in% consecutive_all) %>%
+    mutate(
+        xmin = case_when(grepl("Fast.*Refeed|Refeed.*Fast", contrast) ~ "Fast",
+                         grepl("Refeed.*Chow|Chow.*Refeed", contrast) ~ "Refeed",
+                         grepl("Chow.*HFD|HFD.*Chow", contrast) ~ "Chow"),
+        xmax = case_when(grepl("Fast.*Refeed|Refeed.*Fast", contrast) ~ "Refeed",
+                         grepl("Refeed.*Chow|Chow.*Refeed", contrast) ~ "Chow",
+                         grepl("Chow.*HFD|HFD.*Chow", contrast) ~ "HFD"),
+        label = case_when(padj < 0.001 ~ "***", padj < 0.01 ~ "**", padj < 0.05 ~ "*", padj < 0.1 ~ "+", TRUE ~ "ns")
+    ) %>%
+    filter(label != "ns") %>%
+    distinct(ct_label, xmin, xmax, label, padj)
+
+# Y positions per facet
+y_max_all <- lgs_all %>%
+    group_by(ct_label) %>%
+    summarise(y_max = max(mean_lgs), .groups = "drop")
+y_range_all <- diff(range(lgs_all$mean_lgs))
+
+signif_all <- signif_all %>%
+    left_join(y_max_all, by = "ct_label") %>%
+    group_by(ct_label) %>%
+    mutate(y_pos = y_max + y_range_all * 0.05 * row_number()) %>%
+    ungroup()
+
+p_lgs_all <- ggplot(lgs_all, aes(treatment, mean_lgs, fill = treatment)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6, linewidth = 0.35) +
+    geom_jitter(width = 0.15, size = 0.5, alpha = 0.5, shape = 16) +
+    facet_wrap(~ct_label, nrow = 1, scales = "free_y") +
+    scale_fill_manual(values = diet_cols) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none",
+          strip.background = element_blank()) +
+    labs(x = NULL, y = "Leptin Gene Signature")
+
+if (nrow(signif_all) > 0) {
+    p_lgs_all <- p_lgs_all +
+        ggsignif::geom_signif(
+            data = signif_all, inherit.aes = FALSE,
+            aes(xmin = xmin, xmax = xmax, y_position = y_pos, annotations = label),
+            manual = TRUE, textsize = 2.5, tip_length = 0.01, vjust = 0.5
+        )
+}
+
+ggsave(paste0(fig_path_2, "figure2d_lgs_all_clusters.pdf"), plot = p_lgs_all, h = 3, w = 8)
+
+# Print full stats table for reference
+cat("\n=== LGS stats — all Lepr clusters, all pairwise contrasts ===\n")
+lgs_emm %>%
+    arrange(ct_label, contrast) %>%
+    mutate(sig = case_when(padj < 0.001 ~ "***", padj < 0.01 ~ "**", padj < 0.05 ~ "*", TRUE ~ "")) %>%
+    print(n = 50)
+
+# Key contrasts for manuscript: Chow vs HFD and Chow vs Fast per cluster
+cat("\n=== Key contrasts: Chow vs HFD ===\n")
+lgs_emm %>%
+    filter(grepl("Chow.*HFD|HFD.*Chow|Chow.*Fast|Fast.*Chow", contrast)) %>%
+    arrange(ct_label, contrast) %>%
+    print(n = 20)
+```
+
+## Figure 2e — Hierarchical clustering of DEGs in Lepr/Glp1r neurons
+
+```{r panel_2e_deg_analysis}
+pb_objects  <- list()
+fit_objects <- list()
+
+for (ct in lepclus) {
+    pb_objects[[ct]] <- edger_prep(
+        subset(arc_diet_labeled, subset = hash.mcl.ID != "REFED2"),
+        celltype_column = "seurat_clusters", trt_group = "treatment", celltypes = ct
+    )
+}
+
+deg_results <- list()
+
+for (ct in lepclus) {
+    keep <- filterByExpr(pb_objects[[ct]], group = pb_objects[[ct]]$samples$treatment,
+                         min.count = 5, min.total.count = 15)
+    pb_objects[[ct]] <- pb_objects[[ct]][keep, , keep.lib.sizes = FALSE]
+    pb_objects[[ct]] <- normLibSizes(pb_objects[[ct]])
+    pb_objects[[ct]]$samples$treatment <- factor(pb_objects[[ct]]$samples$treatment,
+                                                 levels = c("Chow", "HFD", "Refeed", "Fast"))
+    design <- model.matrix(~treatment + hash_pool, data = pb_objects[[ct]]$samples)
+    colnames(design) <- gsub(":", "_", colnames(design))
+    pb_objects[[ct]] <- estimateDisp(pb_objects[[ct]], design, robust = TRUE)
+    fit <- glmQLFit(pb_objects[[ct]], design, robust = TRUE)
+    fit_objects[[ct]] <- fit   # save fit for per-contrast extraction
+    qlf <- glmQLFTest(fit, coef = 2:4)
+    deg_results[[ct]] <- topTags(qlf, n = Inf, p = 0.05)
+}
+
+alldeg <- purrr::map_dfr(deg_results, data.frame, .id = "ct")
+write_csv(alldeg, paste0(tab_path_2, "diet_degenes.csv"))
+cat("Total diet DEGs across Lepr clusters (FDR < 0.05):", nrow(alldeg), "\n")
+cat("DEGs in Lepr/Glp1r cluster 12:", nrow(alldeg[alldeg$ct == "12", ]), "\n")
+```
+
+## Pearson's r — Fast vs DIO logFC anti-correlation in Lepr/Glp1r neurons (cluster 12)
+
+```{r panel_2e_pearson, fig.width=8, fig.height=3}
+# Scatter: HFD logFC (x) vs Fasting logFC (y) for AgRP, Lepr/Glp1r, POMC
+# Uses F-test DEGs per cluster (genes responsive to any nutritional state)
+cor_clusters <- c("Agrp", "12", "29")
+cor_labels <- c("Agrp" = "AgRP", "12" = "Lepr/Glp1r", "29" = "POMC")
+
+cor_plot_data <- list()
+cor_stats <- list()
+
+for (ct in cor_clusters) {
+    ct_degs <- alldeg %>% filter(ct == !!ct) %>% pull(gene)
+    if (length(ct_degs) < 10) next
+
+    fast_fc <- alldeg %>% filter(ct == !!ct) %>%
+        dplyr::select(gene, logFC_fast = logFC.treatmentFast)
+    hfd_fc <- alldeg %>% filter(ct == !!ct) %>%
+        dplyr::select(gene, logFC_hfd = logFC.treatmentHFD)
+
+    merged <- inner_join(fast_fc, hfd_fc, by = "gene") %>%
+        mutate(ct_label = cor_labels[ct])
+    cor_plot_data[[ct]] <- merged
+
+    ct_cor <- cor.test(merged$logFC_hfd, merged$logFC_fast, method = "pearson")
+    cor_stats[[ct]] <- data.frame(
+        ct_label = cor_labels[ct],
+        r = round(ct_cor$estimate, 3),
+        p = signif(ct_cor$p.value, 3),
+        n = nrow(merged)
+    )
+}
+
+cor_all <- bind_rows(cor_plot_data) %>%
+    mutate(ct_label = factor(ct_label, levels = c("AgRP", "Lepr/Glp1r", "POMC")))
+cor_stats_df <- bind_rows(cor_stats) %>%
+    mutate(ct_label = factor(ct_label, levels = c("AgRP", "Lepr/Glp1r", "POMC")),
+           label = sprintf("r = %.3f\np = %.2e", r, p))
+
+p_fvc_hvc <- ggplot(cor_all, aes(logFC_hfd, logFC_fast)) +
+    geom_point(size = 0.3, alpha = 0.3, color = "grey40") +
+    geom_smooth(method = "lm", color = "#C0392B", se = FALSE, linewidth = 0.5) +
+    geom_hline(yintercept = 0, lty = 2, color = "grey60", linewidth = 0.3) +
+    geom_vline(xintercept = 0, lty = 2, color = "grey60", linewidth = 0.3) +
+    geom_text(data = cor_stats_df,
+              aes(x = -Inf, y = Inf, label = label),
+              hjust = -0.1, vjust = 1.2, size = 2.5, color = "#C0392B") +
+    facet_wrap(~ct_label, nrow = 1, scales = "free") +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(strip.background = element_blank()) +
+    labs(x = "log2FC (HFD vs Chow)", y = "log2FC (Fasting vs Chow)")
+
+ggsave(paste0(fig_path_2, "figure2e_fast_hfd_correlation.pdf"), plot = p_fvc_hvc, h = 3, w = 8)
+
+# Print stats
+cat("Pearson correlations (Fasting vs HFD logFC, diet-regulated DEGs):\n")
+print(cor_stats_df)
+```
+
+```{r panel_2e_glp1r_heatmap}
+pbd <- pb_objects[["12"]]
+pbd$samples$treatment <- factor(pbd$samples$treatment, levels = c("Fast", "Refeed", "Chow", "HFD"))
+
+logcpm <- edgeR::cpm(pbd, prior.count = 5, log = T)
+logcpm <- limma::removeBatchEffect(logcpm, pbd$samples$hash_pool,
+                                   design = model.matrix(~treatment, data = pbd$samples))
+
+glp_deg  <- alldeg %>% filter(ct %in% 12) %>% pull(gene)
+expr_dat <- logcpm[rownames(logcpm) %in% glp_deg, ]
+expr_dat <- t(scale(t(expr_dat)))
+
+# Genes to label — neuronal activity, GABA receptors, and leptin-response markers
+tolabel <- c("Nr4a3", "Npas4", "Gabra3", "Gabra4", "Gabra5", "Grip1", "Gabra1", "Sv2c", "Pde10a", "Grin1",
+             "Vgf", "Tenm2", "Itpr1", "Nrcam", "Scn9a", "Fos", "Gabrb1", "Gabrb2", "Gabrb3",
+             "Nr4a1", "Junb", "Stat3", "Bcl3", "Cxcl12")
+idx       <- match(tolabel, rownames(expr_dat))
+valid_idx <- idx[!is.na(idx)]
+valid_lab <- tolabel[!is.na(idx)]
+
+ha <- HeatmapAnnotation(
+    d = pbd$samples$treatment[order(pbd$samples$treatment)],
+    col = list(d = c("HFD" = my_colors[[1]], "Chow" = my_colors[[2]],
+                     "Refeed" = my_colors[[3]], "Fast" = my_colors[[4]])),
+    simple_anno_size = unit(0.3, "cm"), annotation_name_gp = gpar(fontsize = BASE_SIZE))
+ra <- rowAnnotation(foo = anno_mark(at = valid_idx, labels = valid_lab,
+                                    labels_gp = gpar(fontsize = BASE_SIZE)))
+
+pdf(paste0(fig_path_2, "figure2e_glp1r_hmap.pdf"), h = 4, w = 5)
+set.seed(426)
+hmap <- Heatmap(expr_dat[, order(pbd$samples$treatment)],
+    show_row_dend = T, show_row_names = F,
+    right_annotation = ra, row_split = 5,
+    top_annotation = ha, cluster_columns = F,
+    clustering_method_rows = "ward.D2",
+    show_column_names = F, row_names_gp = gpar(fontsize = 2))
+ht <- draw(hmap)
+dev.off()
+
+cluster_genes <- purrr::map(row_order(ht), function(x) rownames(expr_dat)[x])
+names(cluster_genes) <- names(row_order(ht))
+cluster_genes <- enframe(cluster_genes) %>% unnest(value)
+write_csv(cluster_genes, paste0(tab_path_2, "glp1r_lepr_hmap_genes.csv"))
+cat("Total genes in diet heatmap (cluster 12):", nrow(cluster_genes), "\n")
+```
+
+```{r panel_2e_go_enrichment}
+compare_result <- compareCluster(value ~ name,
+    data = cluster_genes, maxGSSize = 300, minGSSize = 5,
+    fun = "enrichGO",
+    OrgDb = org.Mm.eg.db,
+    ont = "ALL",
+    keyType = "SYMBOL",
+    pvalueCutoff = 0.05,
+    universe = rownames(pbd$counts))
+
+compare_result@compareClusterResult %>% write_csv(paste0(tab_path_2, "glp1r_lepr_hmap_goterms.csv"))
+
+topgo <- simplify(compare_result, cutoff = 0.5, by = "p.adjust",
+                  select_fun = min, measure = "Wang", semData = NULL)
+
+dotplot(topgo)
+ggsave(paste0(fig_path_2, "figure2e_goterms.pdf"), h = 10, w = 6)
+```
+
+## Figure 2f — Experimental design schematic (assembled in Illustrator)
+
+<!-- 2f is a schematic of the leptin IP experiment: vehicle n=22, leptin n=20, 1-24h
+     time points. No code required — assembled externally. -->
+
+## Figure 2g — Leptin response per cell type (scDist)
+
+```{r panel_2g_lepip_celldist}
+lepip_cd_data <- lepip_celldist$results %>%
+    rownames_to_column("row") %>%
+    separate(row, into = c("ct", "comp")) %>%
+    janitor::clean_names() %>%
+    dplyr::select(comp, ct, dist, x95_percent_ci_low, x95_percent_ci_upper, p_val) %>%
+    pivot_wider(
+        names_from  = comp,
+        values_from = c(dist, x95_percent_ci_low, x95_percent_ci_upper, p_val)
+    ) %>%
+    filter(ct %in% names(which(table(arc_lepip$predicted.celltype) > 500))) %>%
+    mutate(
+        pt_color = case_when(
+            ct %in% names(lepr_cols) ~ lepr_cols[ct],
+            TRUE ~ "grey70"
+        )
+    )
+
+lepip_cd_data %>%
+    ggplot(aes(fct_reorder(ct, -dist_wt), dist_wt)) +
+    geom_col(aes(fill = I(pt_color),
+                 color = I(ifelse(p_val_wt < 0.05, "black", "white"))),
+             linewidth = 0.3) +
+    geom_errorbar(aes(ymin = x95_percent_ci_low_wt, ymax = x95_percent_ci_upper_wt),
+                  width = 0.3, linewidth = 0.4) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    NoLegend() +
+    labs(x = NULL, y = "Transcriptome Distance (Leptin vs Saline)")
+
+ggsave(paste0(fig_path_2, "figure2g_lepip_celldist.pdf"), h = 3, w = 8)
+```
+
+## Figure 2g2 — LGS response to leptin IP over time
+
+```{r panel_2g2_lgs_lepip_timecourse}
+# Score LGS on leptin IP dataset
+arc_lepip <- AddModuleScore(arc_lepip, features = list(leptin_geneset), assay = "RNA")
+
+# Summarise per animal, cell type, timepoint — all Lepr clusters
+lgs_lepip_all <- arc_lepip[[]] %>%
+    filter(dataset == "lepip" & predicted.celltype %in% c("12", "Agrp", "29", "26", "28"),
+           geno == "wt") %>%
+    mutate(treatment = factor(treatment, c("Lep", "Sal")),
+           ct_label = all_lepr_labels[as.character(predicted.celltype)],
+           ct_label = factor(ct_label, c("AgRP", "Lepr/Glp1r", "POMC", "Tbx19", "Irx3"))) %>%
+    group_by(treatment, ct_label, hash.mcl.ID, time) %>%
+    summarise(mean_lgs = mean(Cluster1), .groups = "drop")
+
+# Linear model per cell type: LGS ~ treatment * time, adjust across all clusters
+lgs_lepip_emm <- lgs_lepip_all %>%
+    nest(data = -ct_label) %>%
+    mutate(
+        mod = purrr::map(data, ~lm(mean_lgs ~ treatment * factor(time), data = .x)),
+        emm = purrr::map(mod, ~emmeans::emmeans(.x, pairwise ~ treatment | time)$contrasts %>% data.frame())
+    ) %>%
+    unnest(emm) %>%
+    ungroup() %>%
+    mutate(padj = p.adjust(p.value, "BH"))
+
+write_csv(lgs_lepip_emm, paste0(tab_path_2, "lgs_lepip_timecourse_stats.csv"))
+
+# Plot: effect size (Lep - Sal) over time — focal 3 only
+lgs_lepip_plot <- lgs_lepip_emm %>%
+    filter(ct_label %in% focal_labels) %>%
+    mutate(sig = padj < 0.05)
+
+p_lgs_time <- ggplot(lgs_lepip_plot) +
+    aes(x = factor(time, levels = c("1", "3", "6", "24")), y = estimate,
+        color = ct_label, group = ct_label) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_line() +
+    geom_errorbar(aes(ymin = estimate - SE, ymax = estimate + SE), width = 0) +
+    geom_point(data = ~filter(.x, !sig), shape = 21, size = 2, fill = "white", stroke = 0.5) +
+    geom_point(data = ~filter(.x, sig), aes(fill = ct_label), shape = 21, size = 2, stroke = 0.5) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    labs(x = "Hours post-injection", y = "LGS (Leptin - Saline)") +
+    NoLegend()
+
+ggsave(paste0(fig_path_2, "figure2g2_lgs_lepip_timecourse.pdf"), plot = p_lgs_time, h = 3, w = 4)
+```
+
+## Figure 2h — Leptin-regulated gene heatmaps (AgRP and Lepr/Glp1r neurons)
+
+```{r panel_2h_agrp_timecourse}
+pb <- pseudobulk_lepip[["Agrp"]]
+pb <- pb[, pb$samples$dataset == "lepip" & pb$samples$time != 24 & pb$samples$geno == "wt"]
+colnames(pb) <- paste0(colnames(pb), "_", pb$samples$time)
+pb$samples$treatment <- factor(pb$samples$treatment, levels = c("Sal", "Lep"))
+pb$samples$time      <- factor(pb$samples$time, levels = c("1", "3", "6"))
+
+design <- model.matrix(~treatment + time + hash_pool, data = pb$samples)
+colnames(design) <- gsub(":", "_", gsub("[()]", "", colnames(design)))
+
+fit <- voomLmFit(pb, design)
+fit2 <- eBayes(fit, robust = TRUE)
+
+agrp_lep_all <- topTable(fit2, coef = "treatmentLep", n = Inf)
+write_csv(agrp_lep_all %>% { if (!"gene" %in% names(.)) rownames_to_column(., "gene") else . },
+          paste0(tab_path_2, "agrp_leptin_degs_wt.csv"))
+cat("AgRP WT leptin DEGs (FDR < 0.05):", sum(agrp_lep_all$adj.P.Val < 0.05), "\n")
+
+alldeg_agrp <- topTable(fit2, coef = "treatmentLep", n = Inf, p = 0.1)
+filtdeg_agrp <- alldeg_agrp[abs(alldeg_agrp$logFC) > 0.5, ]
+
+logcpm_agrp <- edgeR::cpm(pb, prior.count = 5, log = T)
+logcpm_agrp <- limma::removeBatchEffect(logcpm_agrp, batch = pb$samples$hash_pool,
+    design = model.matrix(~treatment + time, data = pb$samples))
+
+expr_data <- t(scale(t(logcpm_agrp[rownames(logcpm_agrp) %in% rownames(filtdeg_agrp), ])))
+gene_hclust <- hclust(dist(expr_data), method = "ward.D2")
+clusters <- cutree(gene_hclust, k = 4)
+
+df <- bind_cols(data.frame(expr_data, check.names = F), enframe(clusters)) %>%
+    pivot_longer(c(-name, -value), names_to = "sample", values_to = "expression") %>%
+    separate(sample, into = c("hash.mcl.ID", "treatment", "time"), sep = "_")
+
+agrp_timeplot <- df %>%
+    group_by(value, time, treatment, hash.mcl.ID) %>%
+    summarise(mean = mean(expression)) %>%
+    ggplot() +
+    aes(factor(time, c(1, 3, 6, 24)), mean,
+        group = treatment, color = treatment) +
+    stat_summary(geom = "point", size = 0.5) +
+    stat_summary(geom = "line", linewidth = 0.25) +
+    facet_wrap(~value, ncol = 1, scales = "free_y", switch = "y") +
+    scale_color_manual(values = c("Lep" = "red", "Sal" = "black")) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(strip.text       = element_text(colour = "black"),
+          strip.background = element_rect(fill = "white"),
+          strip.placement  = "outside") +
+    labs(x = NULL, y = NULL, color = NULL) +
+    scale_x_discrete(expand = c(0.05, 0))
+
+ggsave(paste0(fig_path_2, "figure2h_agrp_timecourse.pdf"), plot = agrp_timeplot, h = 5, w = 2)
+```
+
+```{r panel_2h_glp1r_lepip_heatmap}
+pb_glp <- pseudobulk_lepip[["12"]]
+pb_glp <- pb_glp[, pb_glp$samples$dataset == "lepip" & pb_glp$samples$time != 24 & pb_glp$samples$geno == "wt"]
+colnames(pb_glp) <- paste0(colnames(pb_glp), "_", pb_glp$samples$time)
+pb_glp$samples$treatment <- factor(pb_glp$samples$treatment, levels = c("Sal", "Lep"))
+pb_glp$samples$time      <- factor(pb_glp$samples$time, levels = c("1", "3", "6"))
+
+design_glp <- model.matrix(~treatment + time + hash_pool, data = pb_glp$samples)
+colnames(design_glp) <- gsub(":", "_", gsub("[()]", "", colnames(design_glp)))
+
+fit_glp  <- voomLmFit(pb_glp, design_glp)
+fit2_glp <- eBayes(fit_glp, robust = TRUE)
+
+glp1r_lep_all <- topTable(fit2_glp, coef = "treatmentLep", n = Inf)
+write_csv(glp1r_lep_all %>% { if (!"gene" %in% names(.)) rownames_to_column(., "gene") else . },
+          paste0(tab_path_2, "glp1r_leptin_degs_wt.csv"))
+cat("Lepr/Glp1r WT leptin DEGs (FDR < 0.05):", sum(glp1r_lep_all$adj.P.Val < 0.05), "\n")
+
+alldeg_glp  <- topTable(fit2_glp, coef = "treatmentLep", n = Inf, p = 0.1)
+filtdeg_glp <- alldeg_glp[abs(alldeg_glp$logFC) > 0.5, ]
+
+logcpm_glp <- edgeR::cpm(pb_glp, prior.count = 5, log = T)
+logcpm_glp <- limma::removeBatchEffect(logcpm_glp, batch = pb_glp$samples$hash_pool,
+    design = model.matrix(~treatment + time, data = pb_glp$samples))
+
+expr_glp <- t(scale(t(logcpm_glp[rownames(logcpm_glp) %in% rownames(filtdeg_glp), ])))
+
+tolabel_glp <- c("Fos", "Fosb", "Nr4a1", "Nr4a3", "Socs3", "Stat3", "Egr1", "Vgf", "Npy", "Pomc")
+idx_glp <- match(tolabel_glp, rownames(expr_glp))
+valid   <- !is.na(idx_glp)
+ra_glp  <- rowAnnotation(foo = anno_mark(at = idx_glp[valid], labels = tolabel_glp[valid],
+                                         labels_gp = gpar(fontsize = BASE_SIZE)))
+
+pdf(paste0(fig_path_2, "figure2h_glp1r_hmap.pdf"), h = 4, w = 5)
+set.seed(426)
+Heatmap(expr_glp[, order(pb_glp$samples$treatment)],
+    show_row_dend = T, show_row_names = F,
+    right_annotation = ra_glp, row_split = 4,
+    cluster_columns = F, clustering_method_rows = "ward.D2",
+    show_column_names = F, row_names_gp = gpar(fontsize = 2))
+dev.off()
+```
+
+---
+
+## Supplemental — Leptin IP DE gene counts per cluster (WT only)
+
+```{r lepip_de_all_clusters}
+# Run DE for all clusters (WT only, treatment + time + hash_pool where possible)
+lepip_de_counts <- list()
+
+for (ct in celltypes) {
+    pb <- pseudobulk_lepip[[ct]]
+    keep <- pb$samples$dataset == "lepip" & pb$samples$time != 24 & pb$samples$geno == "wt"
+    if (sum(keep) < 6) next
+    pb_sub <- pb[, keep]
+    colnames(pb_sub) <- make.unique(colnames(pb_sub))
+    pb_sub$samples$treatment <- factor(pb_sub$samples$treatment, levels = c("Sal", "Lep"))
+    pb_sub$samples$time <- factor(pb_sub$samples$time)
+
+    # Try with hash_pool; fall back without if rank-deficient
+    design <- tryCatch({
+        d <- model.matrix(~ treatment + time + hash_pool, data = pb_sub$samples)
+        if (qr(d)$rank < ncol(d)) stop("rank deficient")
+        d
+    }, error = function(e) model.matrix(~ treatment + time, data = pb_sub$samples))
+
+    tt <- tryCatch({
+        f <- voomLmFit(pb_sub, design)
+        f <- eBayes(f, robust = TRUE)
+        topTable(f, coef = "treatmentLep", n = Inf)
+    }, error = function(e) NULL)
+    if (is.null(tt)) next
+
+    lepip_de_counts[[ct]] <- data.frame(
+        cell_type = ct,
+        n_up = sum(tt$adj.P.Val < 0.05 & tt$logFC > 0, na.rm = TRUE),
+        n_down = sum(tt$adj.P.Val < 0.05 & tt$logFC < 0, na.rm = TRUE)
+    )
+}
+
+lepip_de_df <- bind_rows(lepip_de_counts) %>%
+    mutate(total = n_up + n_down) %>%
+    arrange(desc(total))
+
+write_csv(lepip_de_df, paste0(tab_path_2, "lepip_de_counts_all_clusters.csv"))
+cat("Leptin IP DE gene counts (WT only, all clusters):\n")
+print(lepip_de_df %>% filter(total > 0))
+```
+
+## Supplemental — Leptin IP UMAP overlay
+
+```{r panel_supp_lepip_umap}
+# Use ref.umap if available (reference-based projection), otherwise fall back to umap
+diet_umap_key  <- intersect(c("ref.umap", "umap"), names(arc_diet_labeled@reductions))[1]
+lepip_umap_key <- intersect(c("ref.umap", "umap"), names(arc_lepip@reductions))[1]
+
+diet_coords <- data.frame(arc_diet_labeled@reductions[[diet_umap_key]]@cell.embeddings)
+colnames(diet_coords)[1:2] <- c("U1", "U2")
+diet_coords$diet    <- arc_diet_labeled$treatment
+diet_coords$dataset <- "diet"
+
+lepip_coords <- data.frame(arc_lepip@reductions[[lepip_umap_key]]@cell.embeddings) %>%
+    dplyr::sample_frac(0.2)
+colnames(lepip_coords)[1:2] <- c("U1", "U2")
+lepip_coords$diet    <- NA
+lepip_coords$dataset <- "lepip"
+
+mapping_df <- bind_rows(diet_coords, lepip_coords)
+
+bg_plot <- ggplot(mapping_df[mapping_df$dataset == "lepip", ]) +
+    aes(U1, U2) +
+    geom_point(shape = ".", alpha = 0.1, color = "grey70") +
+    theme_void() + coord_equal()
+
+bg_plot +
+    geom_point(data = mapping_df[!is.na(mapping_df$diet) & mapping_df$diet == "HFD", ],
+               color = cols_by_diet[2], size = 0.15) +
+    geom_point(data = mapping_df[!is.na(mapping_df$diet) & mapping_df$diet == "Fast", ],
+               color = cols_by_diet[1], size = 0.15) +
+    geom_point(data = mapping_df[!is.na(mapping_df$diet) & mapping_df$diet == "Refeed", ],
+               color = cols_by_diet[3], size = 0.15)
+
+ggsave(paste0(fig_path_2, "supp_lepip_umap.pdf"), h = 5, w = 5)
+```
+
+## Figure 2i — HFD vs Leptin gene overlap in Lepr/Glp1r neurons
+
+```{r panel_supp_hfd_lep_overlap}
+# Self-contained: rebuilds both models from scratch so this chunk runs independently
+
+# --- Diet: HFD vs Chow in cluster 12 ---
+pb_ov_diet <- edger_prep(
+    subset(arc_diet_labeled, subset = hash.mcl.ID != "REFED2"),
+    celltype_column = "seurat_clusters", trt_group = "treatment", celltypes = "12"
+)
+pb_ov_diet$samples$treatment <- factor(pb_ov_diet$samples$treatment,
+                                       levels = c("Chow", "HFD", "Refeed", "Fast"))
+design_ov  <- model.matrix(~treatment + hash_pool, data = pb_ov_diet$samples)
+pb_ov_diet <- estimateDisp(pb_ov_diet, design_ov, robust = TRUE)
+fit_ov     <- glmQLFit(pb_ov_diet, design_ov, robust = TRUE)
+qlf_hfd    <- glmQLFTest(fit_ov, coef = 2)   # coef 2 = treatmentHFD vs Chow
+diet_all   <- topTags(qlf_hfd, n = Inf)$table %>%
+    dplyr::select(gene, logFC_hfd = logFC, FDR_hfd = FDR)
+
+# --- Leptin: WT-only response in cluster 12 ---
+pb_ov_lep <- pseudobulk_lepip[["12"]]
+pb_ov_lep <- pb_ov_lep[, pb_ov_lep$samples$dataset == "lepip" & pb_ov_lep$samples$time != 24 & pb_ov_lep$samples$geno == "wt"]
+colnames(pb_ov_lep) <- paste0(colnames(pb_ov_lep), "_", pb_ov_lep$samples$time)
+pb_ov_lep$samples$treatment <- factor(pb_ov_lep$samples$treatment, levels = c("Sal", "Lep"))
+pb_ov_lep$samples$time      <- factor(pb_ov_lep$samples$time, levels = c("1", "3", "6"))
+design_lep <- model.matrix(~treatment + time + hash_pool, data = pb_ov_lep$samples)
+colnames(design_lep) <- gsub(":", "_", gsub("[()]", "", colnames(design_lep)))
+fit_lep    <- voomLmFit(pb_ov_lep, design_lep)
+fit2_lep   <- eBayes(fit_lep, robust = TRUE)
+lep_all    <- topTable(fit2_lep, coef = "treatmentLep", n = Inf) %>%
+    dplyr::select(gene, logFC_lep = logFC, FDR_lep = adj.P.Val)
+
+# --- Merge with directional consistency ---
+overlap_df <- inner_join(diet_all, lep_all, by = "gene") %>%
+    mutate(
+        same_dir  = sign(logFC_hfd) == sign(logFC_lep),
+        sig_group = case_when(
+            FDR_hfd < 0.05 & FDR_lep < 0.05 & same_dir  ~ "Concordant",
+            FDR_hfd < 0.05 & FDR_lep < 0.05 & !same_dir ~ "Discordant",
+            FDR_hfd < 0.05                               ~ "Diet only",
+            FDR_lep < 0.05                               ~ "Leptin only",
+            TRUE                                         ~ "Neither"
+        )
+    )
+
+write_csv(overlap_df, paste0(tab_path_2, "hfd_lep_overlap_clus12.csv"))
+
+# --- Pearson correlation across all expressed genes ---
+cor_test  <- cor.test(overlap_df$logFC_hfd, overlap_df$logFC_lep, method = "pearson")
+cor_label <- sprintf("r = %.2f, p = %.2e", cor_test$estimate, cor_test$p.value)
+
+# Genes to label: activity genes (IEGs) and canonical leptin targets
+label_activity <- c("Fos", "Fosb", "Jun", "Junb", "Vgf", "Homer1", "Nr4a1", "Egr1")
+label_leptin   <- c("Socs3", "Atf3", "Etv6", "Sbno2", "Nlrc5", "Stat3", "Cish", "Bcl3")
+label_gaba     <- c("Gabra3", "Gabra4", "Gabra5", "Gabrb1", "Gabrb2", "Gabrb3")
+
+overlap_df <- overlap_df %>%
+    mutate(
+        label_class = case_when(
+            gene %in% label_activity ~ "Activity",
+            gene %in% label_leptin   ~ "Leptin target",
+            gene %in% label_gaba     ~ "GABA receptor",
+            TRUE ~ NA_character_
+        ),
+        label = ifelse(!is.na(label_class) & sig_group == "Concordant", gene, NA_character_)
+    )
+
+# Label colors by gene class
+label_cols <- c("Activity" = "#E74C3C", "Leptin target" = "#2980B9", "GABA receptor" = "#27AE60")
+
+# Restrict to HFD DE genes only
+hfd_sig_df <- overlap_df %>% filter(FDR_hfd < 0.05)
+
+# Recalculate Pearson on HFD DE genes only
+cor_test_hfd <- cor.test(hfd_sig_df$logFC_hfd, hfd_sig_df$logFC_lep, method = "pearson")
+cor_label_hfd <- sprintf("r = %.2f, p = %.2e, n = %d", cor_test_hfd$estimate, cor_test_hfd$p.value, nrow(hfd_sig_df))
+
+highlight_df <- hfd_sig_df %>% filter(!is.na(label_class))
+
+p_overlap <- ggplot(hfd_sig_df, aes(logFC_hfd, logFC_lep)) +
+    geom_hline(yintercept = 0, lty = 2, color = "grey50", linewidth = 0.3) +
+    geom_vline(xintercept = 0, lty = 2, color = "grey50", linewidth = 0.3) +
+    geom_point(data = ~filter(.x, sig_group != "Concordant"),
+               color = "grey60", size = 0.6, alpha = 0.5) +
+    geom_point(data = ~filter(.x, sig_group == "Concordant"),
+               color = "#C0392B", size = 0.8, alpha = 0.6) +
+    geom_smooth(method = "lm", color = "black", se = FALSE, linewidth = 0.5) +
+    geom_point(data = highlight_df,
+               aes(fill = label_class), shape = 21, size = 2.5, stroke = 0.4, color = "black") +
+    scale_fill_manual(values = label_cols) +
+    ggrepel::geom_text_repel(
+        data = highlight_df,
+        aes(label = gene, color = label_class),
+        size = 2, fontface = "italic", max.overlaps = 25,
+        min.segment.length = 0, segment.size = 0.3,
+        show.legend = FALSE
+    ) +
+    scale_color_manual(values = label_cols) +
+    annotate("text", x = -Inf, y = Inf, label = cor_label_hfd,
+             hjust = -0.1, vjust = 1.3, size = 2.5) +
+    annotate("text", x = Inf, y = -Inf,
+             label = paste0(sum(hfd_sig_df$sig_group == "Concordant"), " concordant / ",
+                            nrow(hfd_sig_df), " HFD DE genes"),
+             hjust = 1.1, vjust = -0.5, size = 2, color = "grey40") +
+    labs(x = "log2FC (HFD vs Chow)", y = "log2FC (Leptin vs Saline)",
+         fill = NULL) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(legend.position = "bottom", legend.text = element_text(size = BASE_SIZE - 1))
+
+ggsave(paste0(fig_path_2, "figure2i_hfd_lep_overlap.pdf"), plot = p_overlap, h = 4, w = 4.5)
+
+# --- Fisher's exact test: concordant overlap only ---
+cont_table <- with(overlap_df, table(
+    HFD_sig        = FDR_hfd < 0.05,
+    Leptin_concord = FDR_lep < 0.05 & same_dir
+))
+fish_res <- fisher.test(cont_table)
+
+cat("Fisher's exact test — concordant HFD x Leptin DEGs in Lepr/Glp1r neurons\n")
+print(cont_table)
+cat(sprintf("Odds ratio: %.2f  (95%% CI: %.2f-%.2f)\n",
+            fish_res$estimate, fish_res$conf.int[1], fish_res$conf.int[2]))
+cat(sprintf("p-value: %.3g\n", fish_res$p.value))
+```
+
+## Supplemental — AgRP vs Glp1r/Lepr leptin response overlap
+
+```{r panel_supp_agrp_glp1r_lep_overlap}
+# Self-contained: rebuilds both models from scratch
+
+# --- AgRP neurons: WT leptin response ---
+pb_a <- pseudobulk_lepip[["Agrp"]]
+pb_a <- pb_a[, pb_a$samples$dataset == "lepip" & pb_a$samples$time != 24 & pb_a$samples$geno == "wt"]
+colnames(pb_a) <- paste0(colnames(pb_a), "_", pb_a$samples$time)
+pb_a$samples$treatment <- factor(pb_a$samples$treatment, levels = c("Sal", "Lep"))
+pb_a$samples$time      <- factor(pb_a$samples$time, levels = c("1", "3", "6"))
+design_a <- model.matrix(~treatment + time + hash_pool, data = pb_a$samples)
+colnames(design_a) <- gsub(":", "_", gsub("[()]", "", colnames(design_a)))
+fit2_a   <- eBayes(voomLmFit(pb_a, design_a), robust = TRUE)
+agrp_all <- topTable(fit2_a, coef = "treatmentLep", n = Inf) %>%
+    dplyr::select(gene, logFC_agrp = logFC, FDR_agrp = adj.P.Val)
+
+# --- Glp1r/Lepr neurons (cluster 12): WT-only leptin response ---
+pb_g <- pseudobulk_lepip[["12"]]
+pb_g <- pb_g[, pb_g$samples$dataset == "lepip" & pb_g$samples$time != 24 & pb_g$samples$geno == "wt"]
+colnames(pb_g) <- paste0(colnames(pb_g), "_", pb_g$samples$time)
+pb_g$samples$treatment <- factor(pb_g$samples$treatment, levels = c("Sal", "Lep"))
+pb_g$samples$time      <- factor(pb_g$samples$time, levels = c("1", "3", "6"))
+design_g <- model.matrix(~treatment + time + hash_pool, data = pb_g$samples)
+colnames(design_g) <- gsub(":", "_", gsub("[()]", "", colnames(design_g)))
+fit2_g   <- eBayes(voomLmFit(pb_g, design_g), robust = TRUE)
+glp_all  <- topTable(fit2_g, coef = "treatmentLep", n = Inf) %>%
+    dplyr::select(gene, logFC_glp = logFC, FDR_glp = adj.P.Val)
+
+# --- Merge on shared expressed genes ---
+overlap_ag <- inner_join(agrp_all, glp_all, by = "gene") %>%
+    mutate(
+        same_dir  = sign(logFC_agrp) == sign(logFC_glp),
+        sig_group = case_when(
+            FDR_agrp < 0.05 & FDR_glp < 0.05 & same_dir  ~ "Concordant",
+            FDR_agrp < 0.05 & FDR_glp < 0.05 & !same_dir ~ "Discordant",
+            FDR_agrp < 0.05                               ~ "AgRP only",
+            FDR_glp  < 0.05                               ~ "Glp1r only",
+            TRUE                                           ~ "Neither"
+        )
+    )
+
+write_csv(overlap_ag, paste0(tab_path_2, "agrp_glp1r_leptin_overlap.csv"))
+
+count_df <- overlap_ag %>%
+    filter(sig_group != "Neither") %>%
+    dplyr::count(sig_group) %>%
+    mutate(sig_group = factor(sig_group, c("AgRP only", "Glp1r only", "Concordant", "Discordant")))
+
+cat("Leptin-regulated DEG overlap (AgRP vs Glp1r/Lepr, FDR < 0.05):\n")
+print(count_df)
+
+overlap_cols <- c("Concordant"  = "#C0392B",
+                  "Discordant"  = "#8E44AD",
+                  "AgRP only"   = "#9A84B7",
+                  "Glp1r only"  = "#B85182")
+
+p_bar <- ggplot(count_df, aes(sig_group, n, fill = sig_group)) +
+    geom_col(width = 0.7) +
+    geom_text(aes(label = n), vjust = -0.4, size = 2.5) +
+    scale_fill_manual(values = overlap_cols) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 40, hjust = 1)) +
+    labs(x = NULL, y = "Number of DEGs")
+
+ggsave(paste0(fig_path_2, "supp_agrp_glp1r_lep_overlap_bar.pdf"), plot = p_bar, h = 4, w = 4)
+
+cor_ag    <- cor.test(overlap_ag$logFC_agrp, overlap_ag$logFC_glp, method = "pearson")
+cor_label <- sprintf("r = %.2f, p = %.2e", cor_ag$estimate, cor_ag$p.value)
+
+p_scatter <- ggplot(overlap_ag, aes(logFC_agrp, logFC_glp, color = sig_group)) +
+    geom_point(size = 0.4, alpha = 0.4) +
+    geom_smooth(method = "lm", color = "black", se = FALSE, linewidth = 0.5) +
+    scale_color_manual(values = c(overlap_cols, "Neither" = "grey80")) +
+    annotate("text", x = -Inf, y = Inf, label = cor_label,
+             hjust = -0.1, vjust = 1.3, size = 2.5) +
+    labs(x = "AgRP logFC (Leptin vs Sal)",
+         y = "Glp1r/Lepr logFC (Leptin vs Sal)",
+         color = NULL) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(legend.position = "bottom", legend.text = element_text(size = BASE_SIZE - 1))
+
+ggsave(paste0(fig_path_2, "supp_agrp_glp1r_lep_scatter.pdf"), plot = p_scatter, h = 4, w = 4)
+
+cont_ag  <- with(overlap_ag, table(
+    AgRP_sig      = FDR_agrp < 0.05,
+    Glp1r_concord = FDR_glp  < 0.05 & same_dir
+))
+fish_ag <- fisher.test(cont_ag)
+
+cat("\nFisher's exact test — concordant leptin response: AgRP vs Glp1r/Lepr\n")
+print(cont_ag)
+cat(sprintf("Odds ratio: %.2f  (95%% CI: %.2f-%.2f)\n",
+            fish_ag$estimate, fish_ag$conf.int[1], fish_ag$conf.int[2]))
+cat(sprintf("p-value: %.3g\n", fish_ag$p.value))
+```

@@ -1,0 +1,112 @@
+---
+title: "Figure 3k–m: DREADD Activation of Lepr/Glp1r Neurons"
+author: "Dylan Rausch"
+output: html_notebook
+---
+
+Chemogenetic activation of Lepr/Glp1r neurons using an intersectional
+Cre/Dre-dependent DREADD approach (Trh-Cre;Glp1r-Dre). Within-subject
+crossover design (CNO vs saline). Three paradigms:
+
+- **3k**: Dark cycle food intake (first 3h)
+- **3l**: Refeeding after overnight fast
+- **3m**: Ghrelin-induced hyperphagia
+
+## Setup
+
+```{r setup, message=FALSE}
+library(tidyverse)
+library(lme4)
+library(car)
+library(emmeans)
+library(cowplot)
+
+# -- Paths ---------------------------------------------------------------------
+out_dir <- here::here("output_figures/paper/extended_figures/ed_fig3_dreadd")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Load & Prepare Data
+
+```{r load-dreadd}
+dreadd_data <- readxl::read_xlsx(here::here("paper/food_intake_analysis/testing.xlsx"), sheet = 3) %>% filter(Time != 0)
+```
+
+## Model: Dark Cycle Intake (Figure 3k)
+
+```{r model-darkcycle}
+# Log-time model for cumulative intake
+mod_darkcycle <- dreadd_data %>%
+  filter(Exp == "DarkCycle") %>%
+  pivot_longer(starts_with("FEN")) %>%
+  mutate(value = log1p(value),
+         log_time = log(Time)) %>%
+  lmer(value ~ Trt * log_time + (1 | name), data = .)
+
+car::Anova(mod_darkcycle, type = "II")
+
+# Factor-time model for timepoint-specific post-hoc
+mod_darkcycle_fac <- dreadd_data %>%
+  filter(Exp == "DarkCycle") %>%
+  pivot_longer(starts_with("FEN")) %>%
+  mutate(value = log1p(value), time = factor(Time)) %>%
+  lmer(value ~ Trt * time + (1 | name), data = .)
+
+emmeans(mod_darkcycle_fac, ~ Trt * time) %>%
+  pairs(by = "time") %>%
+  data.frame()
+```
+
+## Model: Fasting-Refeeding (Figure 3l)
+
+```{r model-refeed}
+mod_refeed <- dreadd_data %>%
+  filter(Exp == "Refeed") %>%
+  pivot_longer(starts_with("FEN")) %>%
+  mutate(value = log1p(value),
+         log_time = log(Time)) %>%
+  lmer(value ~ Trt * log_time + (1 | name), data = .)
+
+car::Anova(mod_refeed, type = "II")
+
+mod_refeed_fac <- dreadd_data %>%
+  filter(Exp == "Refeed") %>%
+  pivot_longer(starts_with("FEN")) %>%
+  mutate(value = log1p(value), time = factor(Time)) %>%
+  lmer(value ~ Trt * time + (1 | name), data = .)
+
+emmeans(mod_refeed_fac, ~ Trt * time) %>%
+  pairs(by = "time") %>%
+  data.frame()
+```
+
+## Model: Ghrelin-Induced Feeding (Figure 3m)
+
+```{r model-ghrelin}
+mod_ghrelin <- dreadd_data %>%
+  filter(Exp == "Ghrelin") %>%
+  pivot_longer(starts_with("FEN")) %>%
+  mutate(value = log1p(value),
+         log_time = log(Time)) %>%
+  lmer(value ~ Trt * log_time + (1 | name), data = .)
+
+car::Anova(mod_ghrelin, type = "II")
+
+mod_ghrelin_fac <- dreadd_data %>%
+  filter(Exp == "Ghrelin") %>%
+  pivot_longer(starts_with("FEN")) %>%
+  mutate(value = log1p(value), time = factor(Time)) %>%
+  lmer(value ~ Trt * time + (1 | name), data = .)
+
+emmeans(mod_ghrelin_fac, ~ Trt * time) %>%
+  pairs(by = "time") %>%
+  data.frame()
+```
+
+## Summary
+
+All three paradigms are modeled as `log1p(cumulative_intake) ~ Treatment * log(Time)`
+with mouse as random intercept (within-subject crossover). Log-time is used because
+cumulative intake follows a logarithmic time course. The primary result is the main
+effect of CNO from `car::Anova()`. Post-hoc pairwise contrasts at each timepoint
+use a factor-time model and are provided via `emmeans`.
