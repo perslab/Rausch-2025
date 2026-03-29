@@ -1,0 +1,514 @@
+---
+title: "Reviewer Response — mTOR pathway analysis in Lepr/Glp1r neurons"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+This analysis addresses a reviewer comment asking whether Lepr/Glp1r neurons
+have relatively lower mTOR pathway activity compared to other Lepr+ cell types
+in DIO, which could explain their preserved leptin sensitivity. Motivated by
+Tan et al. (2025, Cell Metabolism), who showed that increased mTOR activity in
+POMC neurons drives leptin resistance in DIO mice.
+
+```{r libraries_and_data}
+library(Seurat)
+library(tidyverse)
+library(emmeans)
+library(patchwork)
+library(ComplexHeatmap)
+library(circlize)
+
+source(here::here("R/basic_processing.R"))
+source(here::here("R/analysis_wrappers.R"))
+source(here::here("R/helper_functions.R"))
+
+BASE_SIZE <- 8
+fig_path <- here::here("output_figures/paper/reviewer_mtor/")
+tab_path <- here::here("output_figures/paper/reviewer_mtor/tables/")
+dir.create(fig_path, recursive = TRUE, showWarnings = FALSE)
+dir.create(tab_path, recursive = TRUE, showWarnings = FALSE)
+
+diet_cols <- c("HFD" = "#E8682F", "Chow" = "#F0AD74",
+               "Refeed" = "#58C2AF", "Fast" = "#165C5B")
+
+# Load targets
+targets::tar_config_set(store = here::here("_targets"))
+targets::tar_load(arc_diet_labeled)
+targets::tar_load(pb_alldiet)
+targets::tar_load(celltypes_diet)
+names(pb_alldiet) <- celltypes_diet
+
+# Lepr clusters
+DefaultAssay(arc_diet_labeled) <- "RNA"
+all_lepr_clusters <- c("Agrp", "12", "29", "26", "28")
+all_lepr_labels   <- c("Agrp" = "AgRP", "12" = "Lepr/Glp1r", "29" = "POMC",
+                        "26" = "Tbx19", "28" = "Irx3")
+```
+
+## Define mTOR pathway gene sets
+
+```{r mtor_genesets}
+# Core mTORC1 signaling — genes from Reactome + key regulators
+# Positive regulators of mTOR (higher expression = more mTOR activity)
+mtor_positive <- c("Mtor", "Rptor", "Mlst8", "Rheb", "Rraga", "Rragb",
+                    "Rragc", "Rragd", "Lamtor1", "Lamtor2", "Lamtor3",
+                    "Lamtor4", "Lamtor5", "Akt1", "Akt2", "Akt3",
+                    "Pik3ca", "Pik3cb", "Pik3r1")
+
+# Negative regulators of mTOR (higher expression = less mTOR activity)
+mtor_negative <- c("Tsc1", "Tsc2", "Pten", "Ddit4", "Deptor",
+                    "Sesn1", "Sesn2", "Sesn3",
+                    "Prkaa1", "Prkaa2", "Stk11")
+
+# mTOR downstream targets / readouts of activity
+mtor_downstream <- c("Rps6kb1", "Rps6kb2", "Eif4ebp1", "Eif4ebp2",
+                      "Eif4e", "Eif4b", "Rps6")
+
+# Full mTOR module for AddModuleScore
+mtor_all <- c(mtor_positive, mtor_negative, mtor_downstream)
+
+# Check which genes are present in the dataset
+genes_in_data <- intersect(mtor_all, rownames(arc_diet_labeled))
+missing <- setdiff(mtor_all, rownames(arc_diet_labeled))
+cat("mTOR genes found:", length(genes_in_data), "/", length(mtor_all), "\n")
+cat("Missing:", paste(missing, collapse = ", "), "\n")
+
+mtor_positive_present   <- intersect(mtor_positive, rownames(arc_diet_labeled))
+mtor_negative_present   <- intersect(mtor_negative, rownames(arc_diet_labeled))
+mtor_downstream_present <- intersect(mtor_downstream, rownames(arc_diet_labeled))
+
+cat("\nPositive regulators:", length(mtor_positive_present), "—",
+    paste(mtor_positive_present, collapse = ", "), "\n")
+cat("Negative regulators:", length(mtor_negative_present), "—",
+    paste(mtor_negative_present, collapse = ", "), "\n")
+cat("Downstream targets:", length(mtor_downstream_present), "—",
+    paste(mtor_downstream_present, collapse = ", "), "\n")
+```
+
+## mTOR module score across Lepr clusters and diet conditions
+
+```{r mtor_module_score}
+# Score mTOR positive regulators (proxy for mTOR activity)
+arc_diet_labeled <- AddModuleScore(
+    arc_diet_labeled,
+    features = list(mtor_positive_present),
+    name = "mTOR_pos_",
+    assay = "RNA"
+)
+
+# Score mTOR negative regulators
+arc_diet_labeled <- AddModuleScore(
+    arc_diet_labeled,
+    features = list(mtor_negative_present),
+    name = "mTOR_neg_",
+    assay = "RNA"
+)
+
+# Score downstream targets
+arc_diet_labeled <- AddModuleScore(
+    arc_diet_labeled,
+    features = list(mtor_downstream_present),
+    name = "mTOR_down_",
+    assay = "RNA"
+)
+
+# Net mTOR activity estimate: positive regulators - negative regulators
+arc_diet_labeled$mTOR_net <- arc_diet_labeled$mTOR_pos_1 - arc_diet_labeled$mTOR_neg_1
+```
+
+## Panel A — mTOR positive regulator score: Chow vs HFD across Lepr clusters
+
+```{r panel_a_mtor_pos_boxplot, fig.width=6, fig.height=3.5}
+mtor_df <- arc_diet_labeled[[]] %>%
+    filter(seurat_clusters %in% all_lepr_clusters,
+           treatment %in% c("Chow", "HFD")) %>%
+    mutate(ct_label  = all_lepr_labels[as.character(seurat_clusters)],
+           ct_label  = factor(ct_label, c("AgRP", "Lepr/Glp1r", "POMC", "Tbx19", "Irx3")),
+           treatment = factor(treatment, c("Chow", "HFD"))) %>%
+    group_by(hash.mcl.ID, hash_pool, treatment, ct_label) %>%
+    summarise(
+        mean_mtor_pos  = mean(mTOR_pos_1),
+        mean_mtor_neg  = mean(mTOR_neg_1),
+        mean_mtor_down = mean(mTOR_down_1),
+        mean_mtor_net  = mean(mTOR_net),
+        .groups = "drop"
+    )
+
+# Stats: per-cluster Chow vs HFD comparison
+mtor_stats <- mtor_df %>%
+    nest(data = -ct_label) %>%
+    mutate(
+        mod_pos  = map(data, ~lm(mean_mtor_pos ~ treatment, data = .x)),
+        mod_neg  = map(data, ~lm(mean_mtor_neg ~ treatment, data = .x)),
+        mod_net  = map(data, ~lm(mean_mtor_net ~ treatment, data = .x)),
+        emm_pos  = map(mod_pos,  ~emmeans(.x, pairwise ~ treatment)$contrasts %>% as.data.frame()),
+        emm_neg  = map(mod_neg,  ~emmeans(.x, pairwise ~ treatment)$contrasts %>% as.data.frame()),
+        emm_net  = map(mod_net,  ~emmeans(.x, pairwise ~ treatment)$contrasts %>% as.data.frame())
+    )
+
+stats_pos <- mtor_stats %>% unnest(emm_pos) %>%
+    dplyr::select(ct_label, contrast, estimate, SE, p.value) %>%
+    mutate(score = "mTOR_positive_regulators")
+stats_neg <- mtor_stats %>% unnest(emm_neg) %>%
+    dplyr::select(ct_label, contrast, estimate, SE, p.value) %>%
+    mutate(score = "mTOR_negative_regulators")
+stats_net <- mtor_stats %>% unnest(emm_net) %>%
+    dplyr::select(ct_label, contrast, estimate, SE, p.value) %>%
+    mutate(score = "mTOR_net_activity")
+
+mtor_all_stats <- bind_rows(stats_pos, stats_neg, stats_net) %>%
+    mutate(padj = p.adjust(p.value, "BH"))
+
+write_csv(mtor_all_stats, paste0(tab_path, "mtor_module_chow_vs_hfd_stats.csv"))
+cat("\n=== mTOR module score: Chow vs HFD per cluster ===\n")
+mtor_all_stats %>%
+    mutate(sig = case_when(padj < 0.001 ~ "***", padj < 0.01 ~ "**",
+                           padj < 0.05 ~ "*", padj < 0.1 ~ "+", TRUE ~ "ns")) %>%
+    print(n = 30)
+
+# Also test cluster × diet interaction (is cluster 12 different from others?)
+# Use mixed model: animals contribute observations to multiple clusters
+mtor_interaction <- mtor_df %>%
+    mutate(is_leprglp1r = ifelse(ct_label == "Lepr/Glp1r", "Lepr/Glp1r", "Other")) %>%
+    lme4::lmer(mean_mtor_pos ~ is_leprglp1r * treatment + (1 | hash.mcl.ID), data = .)
+
+cat("\n=== Interaction: Lepr/Glp1r vs Others × Diet (mTOR positive regulators) ===\n")
+print(summary(mtor_interaction)$coefficients)
+cat("\nType II Anova (Kenward-Roger):\n")
+print(car::Anova(mtor_interaction, type = "II", test.statistic = "F"))
+
+# Plot: mTOR positive regulator score
+sig_label <- function(p) case_when(p < 0.001 ~ "***", p < 0.01 ~ "**",
+                                    p < 0.05 ~ "*", p < 0.1 ~ "+", TRUE ~ "ns")
+
+signif_pos <- stats_pos %>%
+    left_join(mtor_all_stats %>% filter(score == "mTOR_positive_regulators") %>%
+                  dplyr::select(ct_label, padj), by = "ct_label") %>%
+    mutate(label = sig_label(padj)) %>%
+    filter(label != "ns")
+
+p_mtor_pos <- ggplot(mtor_df, aes(treatment, mean_mtor_pos, fill = treatment)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6, linewidth = 0.35) +
+    geom_jitter(width = 0.15, size = 0.8, alpha = 0.6, shape = 16) +
+    facet_wrap(~ct_label, nrow = 1, scales = "free_y") +
+    scale_fill_manual(values = diet_cols) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none",
+          strip.background = element_blank()) +
+    labs(x = NULL, y = "mTOR Positive Regulator Score",
+         title = "mTOR positive regulators across Lepr+ clusters")
+
+ggsave(paste0(fig_path, "mtor_positive_regulators_chow_hfd.pdf"),
+       plot = p_mtor_pos, h = 3.5, w = 6)
+
+# Plot: mTOR net activity
+p_mtor_net <- ggplot(mtor_df, aes(treatment, mean_mtor_net, fill = treatment)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6, linewidth = 0.35) +
+    geom_jitter(width = 0.15, size = 0.8, alpha = 0.6, shape = 16) +
+    facet_wrap(~ct_label, nrow = 1, scales = "free_y") +
+    scale_fill_manual(values = diet_cols) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none",
+          strip.background = element_blank()) +
+    labs(x = NULL, y = "Net mTOR Activity Score\n(positive - negative regulators)",
+         title = "Net mTOR activity across Lepr+ clusters")
+
+ggsave(paste0(fig_path, "mtor_net_activity_chow_hfd.pdf"),
+       plot = p_mtor_net, h = 3.5, w = 6)
+```
+
+## Panel B — mTOR module across all 4 diet states
+
+```{r panel_b_mtor_all_diets, fig.width=8, fig.height=3.5}
+mtor_alldiets <- arc_diet_labeled[[]] %>%
+    filter(seurat_clusters %in% all_lepr_clusters) %>%
+    mutate(ct_label  = all_lepr_labels[as.character(seurat_clusters)],
+           ct_label  = factor(ct_label, c("AgRP", "Lepr/Glp1r", "POMC", "Tbx19", "Irx3")),
+           treatment = fct_relevel(treatment, c("Fast", "Refeed", "Chow", "HFD"))) %>%
+    group_by(hash.mcl.ID, hash_pool, treatment, ct_label) %>%
+    summarise(mean_mtor_pos = mean(mTOR_pos_1),
+              mean_mtor_net = mean(mTOR_net),
+              .groups = "drop")
+
+# Stats: all pairwise within each cluster
+mtor_alldiets_stats <- mtor_alldiets %>%
+    nest(data = -ct_label) %>%
+    mutate(
+        mod = map(data, ~lm(mean_mtor_pos ~ treatment, data = .x)),
+        emm = map(mod, ~emmeans(.x, pairwise ~ treatment)$contrasts %>% as.data.frame())
+    ) %>%
+    unnest(emm) %>%
+    ungroup() %>%
+    mutate(padj = p.adjust(p.value, "BH")) %>%
+    dplyr::select(ct_label, contrast, estimate, SE, p.value, padj)
+
+write_csv(mtor_alldiets_stats, paste0(tab_path, "mtor_module_all_diets_stats.csv"))
+
+p_mtor_alldiets <- ggplot(mtor_alldiets, aes(treatment, mean_mtor_pos, fill = treatment)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6, linewidth = 0.35) +
+    geom_jitter(width = 0.15, size = 0.5, alpha = 0.5, shape = 16) +
+    facet_wrap(~ct_label, nrow = 1, scales = "free_y") +
+    scale_fill_manual(values = diet_cols) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none",
+          strip.background = element_blank()) +
+    labs(x = NULL, y = "mTOR Positive Regulator Score")
+
+ggsave(paste0(fig_path, "mtor_positive_all_diets.pdf"),
+       plot = p_mtor_alldiets, h = 3.5, w = 8)
+```
+
+## Panel C — Individual mTOR gene expression heatmap (pseudobulk)
+
+```{r panel_c_heatmap, fig.width=7, fig.height=6}
+library(edgeR)
+
+# Build pseudobulk for all Lepr clusters — Chow vs HFD
+mtor_genes_present <- unique(c(mtor_positive_present, mtor_negative_present,
+                                mtor_downstream_present))
+
+pb_heatmap_data <- list()
+
+for (ct in all_lepr_clusters) {
+    # edger_prep already filters genes and normalizes lib sizes internally
+    pb <- edger_prep(
+        subset(arc_diet_labeled, subset = treatment %in% c("Chow", "HFD")),
+        celltype_column = "seurat_clusters", trt_group = "treatment", celltypes = ct
+    )
+
+    # logCPM per sample
+    lcpm <- cpm(pb, log = TRUE, prior.count = 1)
+    genes_avail <- intersect(mtor_genes_present, rownames(lcpm))
+
+    # Mean logCPM per treatment
+    chow_samples <- pb$samples$treatment == "Chow"
+    hfd_samples  <- pb$samples$treatment == "HFD"
+
+    pb_heatmap_data[[ct]] <- data.frame(
+        gene = genes_avail,
+        cluster = all_lepr_labels[ct],
+        logCPM_Chow = rowMeans(lcpm[genes_avail, chow_samples, drop = FALSE]),
+        logCPM_HFD  = rowMeans(lcpm[genes_avail, hfd_samples, drop = FALSE]),
+        logFC_HFD   = rowMeans(lcpm[genes_avail, hfd_samples, drop = FALSE]) -
+                       rowMeans(lcpm[genes_avail, chow_samples, drop = FALSE])
+    )
+}
+
+heatmap_df <- bind_rows(pb_heatmap_data)
+write_csv(heatmap_df, paste0(tab_path, "mtor_gene_expression_pseudobulk.csv"))
+
+# Heatmap of logFC (HFD vs Chow) per gene per cluster
+logfc_mat <- heatmap_df %>%
+    dplyr::select(gene, cluster, logFC_HFD) %>%
+    pivot_wider(names_from = cluster, values_from = logFC_HFD) %>%
+    column_to_rownames("gene") %>%
+    as.matrix()
+
+# Drop genes missing from any cluster (filtered by edger_prep in some clusters)
+logfc_mat <- logfc_mat[complete.cases(logfc_mat), , drop = FALSE]
+
+# Annotate gene category
+gene_cat <- case_when(
+    rownames(logfc_mat) %in% mtor_positive ~ "Positive regulator",
+    rownames(logfc_mat) %in% mtor_negative ~ "Negative regulator",
+    rownames(logfc_mat) %in% mtor_downstream ~ "Downstream target"
+)
+
+row_ha <- rowAnnotation(
+    Category = gene_cat,
+    col = list(Category = c("Positive regulator" = "#D64541",
+                             "Negative regulator" = "#3498DB",
+                             "Downstream target"  = "#F39C12")),
+    annotation_name_gp = gpar(fontsize = 7)
+)
+
+col_fun <- colorRamp2(c(-1, 0, 1), c("#3498DB", "white", "#D64541"))
+
+ht <- Heatmap(
+    logfc_mat,
+    name = "logFC\n(HFD vs Chow)",
+    col = col_fun,
+    cluster_columns = FALSE,
+    cluster_rows = TRUE,
+    right_annotation = row_ha,
+    row_names_gp = gpar(fontsize = 7),
+    column_names_gp = gpar(fontsize = 8),
+    column_names_rot = 45,
+    border = TRUE,
+    column_title = "mTOR pathway genes: HFD vs Chow logFC",
+    column_title_gp = gpar(fontsize = 9)
+)
+
+pdf(paste0(fig_path, "mtor_gene_heatmap_logfc.pdf"), width = 7, height = 6)
+draw(ht)
+dev.off()
+```
+
+## Panel D — Baseline (Chow) mTOR expression across clusters
+
+```{r panel_d_baseline_heatmap, fig.width=7, fig.height=6}
+# Heatmap of absolute logCPM in Chow — do Lepr/Glp1r cells have lower baseline mTOR?
+chow_mat <- heatmap_df %>%
+    dplyr::select(gene, cluster, logCPM_Chow) %>%
+    pivot_wider(names_from = cluster, values_from = logCPM_Chow) %>%
+    column_to_rownames("gene") %>%
+    as.matrix()
+
+# Drop genes missing from any cluster, then Z-score; drop constant rows
+chow_mat <- chow_mat[complete.cases(chow_mat), , drop = FALSE]
+chow_z <- t(scale(t(chow_mat)))
+chow_z <- chow_z[complete.cases(chow_z), , drop = FALSE]
+
+# Rebuild row annotation for filtered genes
+gene_cat_chow <- case_when(
+    rownames(chow_z) %in% mtor_positive ~ "Positive regulator",
+    rownames(chow_z) %in% mtor_negative ~ "Negative regulator",
+    rownames(chow_z) %in% mtor_downstream ~ "Downstream target"
+)
+row_ha_chow <- rowAnnotation(
+    Category = gene_cat_chow,
+    col = list(Category = c("Positive regulator" = "#D64541",
+                             "Negative regulator" = "#3498DB",
+                             "Downstream target"  = "#F39C12")),
+    annotation_name_gp = gpar(fontsize = 7)
+)
+
+ht_chow <- Heatmap(
+    chow_z,
+    name = "Z-score\n(across clusters)",
+    cluster_columns = FALSE,
+    cluster_rows = TRUE,
+    right_annotation = row_ha_chow,
+    row_names_gp = gpar(fontsize = 7),
+    column_names_gp = gpar(fontsize = 8),
+    column_names_rot = 45,
+    border = TRUE,
+    column_title = "mTOR pathway genes: Chow baseline (Z-scored)",
+    column_title_gp = gpar(fontsize = 9)
+)
+
+pdf(paste0(fig_path, "mtor_gene_heatmap_chow_baseline.pdf"), width = 7, height = 6)
+draw(ht_chow)
+dev.off()
+```
+
+## Panel E — DIO-specific mTOR: Cluster 12 vs POMC direct comparison
+
+Per Tan et al. (2025), mTOR drives leptin resistance specifically in POMC neurons.
+We test whether Lepr/Glp1r neurons have lower mTOR activity than POMC in DIO.
+
+```{r panel_e_cluster12_vs_pomc}
+mtor_c12_vs_pomc <- arc_diet_labeled[[]] %>%
+    filter(seurat_clusters %in% c("12", "29"),
+           treatment %in% c("Chow", "HFD")) %>%
+    mutate(ct_label  = all_lepr_labels[as.character(seurat_clusters)],
+           treatment = factor(treatment, c("Chow", "HFD"))) %>%
+    group_by(hash.mcl.ID, hash_pool, treatment, ct_label) %>%
+    summarise(mean_mtor_pos  = mean(mTOR_pos_1),
+              mean_mtor_neg  = mean(mTOR_neg_1),
+              mean_mtor_net  = mean(mTOR_net),
+              .groups = "drop")
+
+# Interaction model: cluster × diet with random intercept for animal
+# Animals contribute pseudobulk to both cluster 12 and 29, so observations
+# from the same animal are not independent
+mod_interaction <- lme4::lmer(
+    mean_mtor_pos ~ ct_label * treatment + (1 | hash.mcl.ID),
+    data = mtor_c12_vs_pomc
+)
+cat("\n=== Lepr/Glp1r vs POMC × Diet interaction (mTOR positive regulators) ===\n")
+print(summary(mod_interaction)$coefficients)
+cat("\nType II Anova:\n")
+print(car::Anova(mod_interaction, type = "II", test.statistic = "F"))
+
+# Same for net activity
+mod_net_int <- lme4::lmer(
+    mean_mtor_net ~ ct_label * treatment + (1 | hash.mcl.ID),
+    data = mtor_c12_vs_pomc
+)
+cat("\n=== Lepr/Glp1r vs POMC × Diet interaction (net mTOR activity) ===\n")
+print(summary(mod_net_int)$coefficients)
+cat("\nType II Anova:\n")
+print(car::Anova(mod_net_int, type = "II", test.statistic = "F"))
+
+# Pairwise: Lepr/Glp1r vs POMC within each diet condition
+emm_ct <- emmeans(mod_interaction, pairwise ~ ct_label | treatment)
+cat("\n=== Pairwise contrasts: Lepr/Glp1r vs POMC within each diet ===\n")
+print(summary(emm_ct$contrasts))
+
+write_csv(
+    bind_rows(
+        as.data.frame(summary(emm_ct$contrasts)) %>% mutate(score = "mTOR_positive"),
+        {
+            emm_net <- emmeans(mod_net_int, pairwise ~ ct_label | treatment)
+            as.data.frame(summary(emm_net$contrasts)) %>% mutate(score = "mTOR_net")
+        }
+    ),
+    paste0(tab_path, "mtor_cluster12_vs_pomc_stats.csv")
+)
+```
+
+## Panel F — Key individual genes (Mtor, Rptor, Tsc1, Tsc2, Ddit4, Pten)
+
+```{r panel_f_individual_genes, fig.width=10, fig.height=5}
+focal_genes <- c("Mtor", "Rptor", "Tsc1", "Tsc2", "Ddit4", "Pten")
+focal_genes <- intersect(focal_genes, rownames(arc_diet_labeled))
+
+ind_df <- FetchData(
+    arc_diet_labeled,
+    vars = c(focal_genes, "seurat_clusters", "treatment", "hash.mcl.ID", "hash_pool")
+) %>%
+    filter(seurat_clusters %in% all_lepr_clusters,
+           treatment %in% c("Chow", "HFD")) %>%
+    mutate(ct_label  = all_lepr_labels[as.character(seurat_clusters)],
+           ct_label  = factor(ct_label, c("AgRP", "Lepr/Glp1r", "POMC", "Tbx19", "Irx3")),
+           treatment = factor(treatment, c("Chow", "HFD"))) %>%
+    pivot_longer(cols = all_of(focal_genes), names_to = "gene", values_to = "expr") %>%
+    group_by(hash.mcl.ID, hash_pool, treatment, ct_label, gene) %>%
+    summarise(mean_expr = mean(expr), .groups = "drop")
+
+p_ind <- ggplot(ind_df, aes(treatment, mean_expr, fill = treatment)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6, linewidth = 0.3) +
+    geom_jitter(width = 0.15, size = 0.5, alpha = 0.5, shape = 16) +
+    facet_grid(gene ~ ct_label, scales = "free_y") +
+    scale_fill_manual(values = diet_cols) +
+    cowplot::theme_cowplot(font_size = BASE_SIZE) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none",
+          strip.background = element_blank()) +
+    labs(x = NULL, y = "Mean Expression")
+
+ggsave(paste0(fig_path, "mtor_individual_genes_chow_hfd.pdf"),
+       plot = p_ind, h = 5, w = 10)
+```
+
+## Summary statistics table
+
+```{r summary_table}
+cat("\n========================================\n")
+cat("SUMMARY: mTOR pathway in Lepr/Glp1r neurons\n")
+cat("========================================\n\n")
+cat("Gene sets used:\n")
+cat("  Positive regulators:", paste(mtor_positive_present, collapse = ", "), "\n")
+cat("  Negative regulators:", paste(mtor_negative_present, collapse = ", "), "\n")
+cat("  Downstream targets:", paste(mtor_downstream_present, collapse = ", "), "\n\n")
+
+cat("Key results (Chow vs HFD):\n")
+mtor_all_stats %>%
+    filter(score == "mTOR_positive_regulators") %>%
+    mutate(sig = sig_label(padj),
+           direction = ifelse(estimate > 0, "higher in Chow", "higher in HFD")) %>%
+    dplyr::select(ct_label, estimate, padj, sig, direction) %>%
+    print()
+
+cat("\nInterpretation relative to Tan et al. (2025) hypothesis:\n")
+cat("If Lepr/Glp1r neurons show lower mTOR activity increase in HFD compared\n")
+cat("to other clusters (especially POMC), this supports the reviewer's suggestion\n")
+cat("that relatively lower mTOR activity preserves leptin sensitivity.\n")
+```

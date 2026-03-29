@@ -851,6 +851,94 @@ cat(sprintf("Odds ratio: %.2f  (95%% CI: %.2f-%.2f)\n",
 cat(sprintf("p-value: %.3g\n", fish_res$p.value))
 ```
 
+## Figure 2i extended — HFD vs Leptin overlap in AgRP and POMC neurons
+
+```{r panel_hfd_lep_overlap_agrp_pomc}
+# Same analysis as Lepr/Glp1r but for AgRP and POMC
+make_overlap_plot <- function(ct_diet, ct_lepip, ct_label) {
+    # Diet DE
+    pb_d <- edger_prep(
+        subset(arc_diet_labeled, subset = hash.mcl.ID != "REFED2"),
+        celltype_column = "seurat_clusters", trt_group = "treatment", celltypes = ct_diet
+    )
+    pb_d$samples$treatment <- factor(pb_d$samples$treatment, levels = c("Chow", "HFD", "Refeed", "Fast"))
+    design_d <- model.matrix(~treatment + hash_pool, data = pb_d$samples)
+    pb_d <- estimateDisp(pb_d, design_d, robust = TRUE)
+    fit_d <- glmQLFit(pb_d, design_d, robust = TRUE)
+    diet <- topTags(glmQLFTest(fit_d, coef = 2), n = Inf)$table %>%
+        dplyr::select(gene, logFC_hfd = logFC, FDR_hfd = FDR)
+
+    # Leptin DE (WT only)
+    pb_l <- pseudobulk_lepip[[ct_lepip]]
+    pb_l <- pb_l[, pb_l$samples$dataset == "lepip" & pb_l$samples$time != 24 & pb_l$samples$geno == "wt"]
+    colnames(pb_l) <- make.unique(colnames(pb_l))
+    pb_l$samples$treatment <- factor(pb_l$samples$treatment, levels = c("Sal", "Lep"))
+    pb_l$samples$time <- factor(pb_l$samples$time)
+    design_l <- model.matrix(~treatment + time + hash_pool, data = pb_l$samples)
+
+    # Check rank
+    if (qr(design_l)$rank < ncol(design_l)) {
+        design_l <- model.matrix(~treatment + time, data = pb_l$samples)
+    }
+
+    fit_l <- voomLmFit(pb_l, design_l)
+    fit_l <- eBayes(fit_l, robust = TRUE)
+    lep <- topTable(fit_l, coef = "treatmentLep", n = Inf) %>%
+        dplyr::select(gene, logFC_lep = logFC, FDR_lep = adj.P.Val)
+
+    # Merge
+    ov <- inner_join(diet, lep, by = "gene") %>%
+        mutate(same_dir = sign(logFC_hfd) == sign(logFC_lep),
+               sig_group = case_when(
+                   FDR_hfd < 0.05 & FDR_lep < 0.05 & same_dir ~ "Concordant",
+                   FDR_hfd < 0.05 & FDR_lep < 0.05 & !same_dir ~ "Discordant",
+                   FDR_hfd < 0.05 ~ "Diet only",
+                   FDR_lep < 0.05 ~ "Leptin only",
+                   TRUE ~ "Neither"
+               ))
+
+    hfd_sig <- ov %>% filter(FDR_hfd < 0.05)
+    n_conc <- sum(hfd_sig$sig_group == "Concordant")
+
+    if (nrow(hfd_sig) > 5) {
+        ct_r <- cor.test(hfd_sig$logFC_hfd, hfd_sig$logFC_lep)
+        r_label <- sprintf("r = %.2f, p = %.2e, n = %d", ct_r$estimate, ct_r$p.value, nrow(hfd_sig))
+    } else {
+        r_label <- sprintf("n = %d HFD DE genes", nrow(hfd_sig))
+    }
+
+    p <- ggplot(hfd_sig, aes(logFC_hfd, logFC_lep)) +
+        geom_hline(yintercept = 0, lty = 2, color = "grey50", linewidth = 0.3) +
+        geom_vline(xintercept = 0, lty = 2, color = "grey50", linewidth = 0.3) +
+        geom_point(data = ~filter(.x, sig_group != "Concordant"), color = "grey60", size = 0.6, alpha = 0.5) +
+        geom_point(data = ~filter(.x, sig_group == "Concordant"), color = "#C0392B", size = 0.8, alpha = 0.6) +
+        geom_smooth(method = "lm", color = "black", se = FALSE, linewidth = 0.5) +
+        annotate("text", x = -Inf, y = Inf, label = r_label, hjust = -0.1, vjust = 1.3, size = 2.5) +
+        annotate("text", x = Inf, y = -Inf,
+                 label = paste0(n_conc, " concordant / ", nrow(hfd_sig), " HFD DE"),
+                 hjust = 1.1, vjust = -0.5, size = 2, color = "grey40") +
+        labs(x = "log2FC (HFD vs Chow)", y = "log2FC (Leptin vs Saline)", title = ct_label) +
+        cowplot::theme_cowplot(font_size = BASE_SIZE)
+
+    cat(ct_label, ": ", nrow(hfd_sig), " HFD DE, ", n_conc, " concordant\n")
+    if (nrow(hfd_sig) > 5) cat("  r = ", round(ct_r$estimate, 3), " p = ", signif(ct_r$p.value, 3), "\n")
+
+    return(p)
+}
+
+p_agrp <- make_overlap_plot("Agrp", "Agrp", "AgRP neurons")
+p_pomc <- make_overlap_plot("29", "29", "POMC neurons")
+
+# Combine all three
+p_combined <- p_overlap + p_agrp + p_pomc +
+    patchwork::plot_layout(nrow = 1) &
+    theme(legend.position = "none")
+
+ggsave(paste0(fig_path_2, "figure2i_hfd_lep_overlap_all.pdf"), plot = p_combined, h = 4, w = 12)
+ggsave(paste0(fig_path_2, "figure2i_hfd_lep_overlap_agrp.pdf"), plot = p_agrp, h = 4, w = 4.5)
+ggsave(paste0(fig_path_2, "figure2i_hfd_lep_overlap_pomc.pdf"), plot = p_pomc, h = 4, w = 4.5)
+```
+
 ## Supplemental — AgRP vs Glp1r/Lepr leptin response overlap
 
 ```{r panel_supp_agrp_glp1r_lep_overlap}
